@@ -8,7 +8,17 @@ xora takes a free-text profile describing a target and generates a **standalone 
 
 ```bash
 cd xora
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -e .
+```
+
+On Kali Linux (or any system with an externally-managed Python environment), the venv step is required. After activating the venv, `xora` will be available for the rest of your session. To reactivate in a new shell: `source .venv/bin/activate`.
+
+Alternatively, use `pipx` for a fully isolated install:
+
+```bash
+pipx install .
 ```
 
 ## Quick Start
