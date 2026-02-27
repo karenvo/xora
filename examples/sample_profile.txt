@@ -1,0 +1,33 @@
+# Personal
+Name: John Smith
+Birthday: 03/15/1988
+Nickname: Johnny, JS
+
+# Relationships
+Partner: Sarah
+Children: Emma, Liam
+
+# Pets
+Dog: Max
+Cat: Whiskers
+
+# Interests
+football, gaming, photography, craft beer, Marvel movies
+Favorite team: Patriots
+
+# Work
+Company: TechCorp
+Role: Software Engineer
+
+# Digital
+Email: john.smith@techcorp.com, jsmith88@gmail.com
+Username: jsmith, johnny_gamer
+Phone: 555-867-5309
+
+# Known Passwords
+Max2020!
+Patriots#88
+Sarah&John1
+
+# Important Dates
+Anniversary: 06/20/2015

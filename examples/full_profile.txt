@@ -1,0 +1,159 @@
+=====================================
+  FAKE PERSONA — FOR TESTING ONLY
+=====================================
+
+--- PERSONAL INFO ---
+Full Name:        Margot Elaine Voss
+Date of Birth:    March 14, 1988
+Age:              37
+Gender:           Female
+Pronouns:         she/her
+SSN (fake):       529-44-8812
+Phone:            (503) 882-4471
+Address:          2847 NE Glisan St, Apt 4B, Portland, OR 97232
+
+--- BACKGROUND ---
+Hometown:         Duluth, MN
+Current City:     Portland, OR
+Nationality:      American
+Ethnicity:        Norwegian/German descent
+Religion:         Lapsed Lutheran, loosely spiritual
+Education:        B.S. Occupational Therapy, University of Minnesota Duluth (2010)
+                  M.S. Occupational Therapy, Pacific University (2013)
+
+--- WORK ---
+Occupation:       Occupational Therapist (Pediatric)
+Employer:         Bright Steps Pediatric Therapy Clinic
+Work Address:     1120 SW Morrison St, Portland, OR 97205
+Work Phone:       (503) 554-9900 ext. 214
+Salary:           $81,400/year
+Years in Role:    6
+
+--- FAMILY & RELATIONSHIPS ---
+Partner:          Derek Alan Munch (engaged, together 4 years)
+Parents:          Karen Voss (mother), Robert Voss (father, deceased 2019)
+Siblings:         One younger brother, Tyler Voss, 33, lives in Minneapolis
+Kids:             None (open to it in a few years)
+Dog:              Biscuit — golden retriever mix, male, age 4, adopted from Multnomah County Shelter
+                  Microchip ID: 982000411823045 (fake)
+                  Vet: Hawthorne Pet Clinic, Dr. Reyes
+
+--- PHYSICAL DESCRIPTION ---
+Height:           5'6"
+Weight:           148 lbs
+Hair:             Dark auburn, shoulder length, usually in a bun
+Eyes:             Hazel
+Distinguishing:   Small scar above left eyebrow (childhood bike accident)
+                  Tattoo of a moth on left forearm
+
+--- HEALTH ---
+Primary Doctor:   Dr. Susan Cho, OHSU Family Medicine
+Insurance:        Regence BlueCross BlueShield
+Conditions:       Generalized anxiety disorder (managed, medication + therapy)
+Medications:      Sertraline 50mg (daily)
+Allergies:        Tree nuts (mild anaphylaxis risk), latex (contact dermatitis)
+Therapist:        Biweekly sessions with therapist in NE Portland
+
+--- INTERESTS & HOBBIES ---
+- Sourdough baking (starter named "Gerald")
+- Trail running (favorite: Forest Park, ~4x/week)
+- Amateur astronomy (has a Celestron 8" telescope on the balcony)
+- Thrift store furniture flipping and upcycling
+- True crime podcasts (current favorite: "Crime Junkie")
+- Bon Iver, Big Thief, Phoebe Bridgers — goes to concerts alone sometimes
+- Paper journaling — has kept one since age 15
+- Hates texting, prefers voice notes
+
+--- TRAVEL ---
+Recent:           Iceland (Reykjavik + Ring Road), October 2025
+Upcoming:         Oaxaca, Mexico, planned for April 2026
+Wishlist:         Japan, Portugal, Patagonia
+Passport #:       B72948831 (fake)
+
+--- TECH & DEVICES ---
+Phone:            Samsung Galaxy S23 (reluctant Android user)
+Laptop:           MacBook Air M2 (personal), Dell work laptop
+Smart Home:       Nest thermostat, no Alexa ("creeps me out")
+Streaming:        Netflix, Spotify Premium, HBO Max
+Social Media:     Instagram (low-key), no Twitter/X, deleted Facebook in 2021
+
+--- FINANCES ---
+Bank:             OnPoint Community Credit Union
+Credit Card:      Visa ending in 4823 (fake)
+Credit Score:     ~741
+Student Loans:    Paid off in 2024 (big deal to her)
+Savings Goal:     Down payment on a house in the next 2 years
+
+--- VEHICLE ---
+Make/Model:       2017 Subaru Outback
+Color:            Wilderness Green
+Plate:            OR — 847 KVX (fake)
+VIN:              1C4RJFBG4HC123456 (fake)
+
+=====================================
+  ACCOUNT CREDENTIALS (FAKE)
+=====================================
+
+--- PRIMARY EMAIL ACCOUNT ---
+Service:          Gmail
+Email:            margot.voss88@gmail.com
+Password:         Biscuit#Trail2019
+
+--- BACKUP EMAIL ---
+Service:          ProtonMail
+Email:            mvoss_pdx@proton.me
+Password:         G3raldTheSourdough!
+
+--- SOCIAL MEDIA ---
+Instagram:
+  Username:       @margot.thrifts
+  Email:          margot.voss88@gmail.com
+  Password:       R1ngRoad_Iceland
+
+--- WORK PORTAL ---
+Service:          Bright Steps Employee Portal
+Username:         mvoss
+Email:            m.voss@brightstepspdx.org
+Password:         OT_Clinic!2021
+
+--- BANKING ---
+Service:          OnPoint Online Banking
+Username:         margot_voss_88
+Password:         Duluth2Pdx#88
+
+--- SHOPPING ---
+Service:          Amazon
+Email:            margot.voss88@gmail.com
+Password:         BiscuitLuvr!23
+
+Service:          Etsy
+Username:         MargotFlipsThrift
+Email:            margot.voss88@gmail.com
+Password:         Thrift&Find_22
+
+--- HEALTH ---
+Service:          MyChart (OHSU patient portal)
+Username:         margot.voss
+Password:         S3rtraline!health
+
+--- STREAMING ---
+Service:          Netflix
+Email:            margot.voss88@gmail.com
+Password:         CrimeJunkie_PDX
+
+Service:          Spotify
+Email:            margot.voss88@gmail.com
+Password:         BonIver4ever88
+
+--- MISC ---
+Service:          Nextdoor
+Username:         MargotatGlisan
+Password:         Biscuit_Neighbor!
+
+Service:          Strava
+Username:         margot_runs_pdx
+Password:         ForestPark#5k
+
+=====================================
+  ALL DATA IN THIS FILE IS FICTIONAL
+=====================================
