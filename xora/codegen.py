@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import string
 import textwrap
 from collections import Counter
 from datetime import datetime
@@ -260,7 +261,7 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
             # Sampled: position-aware substitutions with a strict budget.
             # This avoids noisy global replace() behavior and keeps variants
             # closer to observed human substitutions.
-            results = {word}
+            results = {{word}}
             budget = max(3, max_variants * 3)
             max_sites = min(len(sites), max(1, max_variants))
             # Prefer earlier sites first (often prefix / root substitutions).
@@ -581,8 +582,9 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
               file=sys.stderr)
 
         scored = generate_all(policy)
-        if args.ranked:
-            scored.sort(key=lambda x: x[0], reverse=True)
+        # Always sort before output so truncation (--limit) keeps top candidates.
+        # --ranked is kept for CLI backward compatibility/documentation.
+        scored.sort(key=lambda x: x[0], reverse=True)
 
         print(f"[xora] Candidates generated: {{len(scored):,}}", file=sys.stderr)
 
@@ -621,83 +623,121 @@ _FALLBACK_ENGINE = textwrap.dedent('''\
         pol = policy or DEFAULT_POLICY
         nums = number_suffixes()
         pref_seps = PREFERRED_SEPARATORS or ["!", "_", "#"]
-        wseps = _weighted_seps(pref_seps, total=6)
+        rare_seps = RARE_SEPARATORS or []
+        sep_pool = _weighted_seps(pref_seps + rare_seps, total=8)
         leet_pct = STRENGTH_LEET_PCT
 
         seen: set[str] = set()
         scored: list[tuple[float, str]] = []
         source_counts: dict[str, int] = {}
 
-        # Generation budgets by source (quality-first ordering).
-        budgets = {
-            "chain": 400,
+        # Adaptive budgets by source (quality-first ordering).
+        strength_factor = 1.15 if STRENGTH_TIER == "strong" else (0.9 if STRENGTH_TIER == "weak" else 1.0)
+        base_budgets = {
+            "chain": 280,
             "known": 120,
-            "llm": 300,
-            "template": 1200,
-            "critical": 3200,
-            "medium": 1000,
-            "low": 400,
-            "combo": 1800,
-            "glue": 1200,
-            "account": 600,
+            "llm": 260,
+            "template": 900,
+            "critical": 2600,
+            "medium": 700,
+            "low": 280,
+            "combo": 1300,
+            "glue": 900,
+            "account": 500,
+        }
+        budgets = {
+            k: max(50, int(v * strength_factor))
+            for k, v in base_budgets.items()
         }
 
-        def _add(pw: str, source: str = "critical") -> None:
-            if pw in seen or " " in pw:
-                return
-            if source in budgets and source_counts.get(source, 0) >= budgets[source]:
-                return
+        def _source_full(source: str) -> bool:
+            return source in budgets and source_counts.get(source, 0) >= budgets[source]
+
+        def _add(pw: str, source: str = "critical") -> bool:
+            if not pw or pw in seen or " " in pw:
+                return False
+            if _source_full(source):
+                return False
             seen.add(pw)
             if passes_policy(pw, pol):
                 scored.append((score_candidate(pw), pw))
                 source_counts[source] = source_counts.get(source, 0) + 1
+                return True
+            return False
 
-        # Derivation chain next_likely candidates — highest confidence predictions
+        # Prefer likely domain terms by category weighting signal.
+        top_theme_weight = max(CATEGORY_WEIGHTS.values()) if CATEGORY_WEIGHTS else 0.0
+        theme_aggressive = top_theme_weight >= 0.6
+
+        # --- Chain seeds first (highest confidence) ---
         for chain in DERIVATION_CHAINS:
-            for pw in chain.get("next_likely", [])[:20]:
+            if _source_full("chain"):
+                break
+            next_likely = chain.get("next_likely", [])[:25]
+            members = chain.get("members", [])[:12]
+            for pw in next_likely:
                 _add(pw, "chain")
-                # Also apply case and leet variants for each chain prediction
+                for v in case_variants(pw)[:4]:
+                    _add(v, "chain")
+                for lv in leet_variants(pw, max_variants=4)[:8]:
+                    _add(lv, "chain")
+                for num in nums[:5]:
+                    _add(f"{pw}{num}", "chain")
+                for sep in sep_pool[:3]:
+                    _add(f"{pw}{sep}", "chain")
+                    for num in nums[:4]:
+                        _add(f"{pw}{sep}{num}", "chain")
+            for pw in members:
+                _add(pw, "chain")
                 for v in case_variants(pw)[:3]:
                     _add(v, "chain")
-                for lv in leet_variants(pw, max_variants=4)[:6]:
-                    _add(lv, "chain")
-                # Add limited numeric + separator mutations around next_likely.
-                for num in nums[:4]:
-                    _add(f"{pw}{num}", "chain")
-                for sep in pref_seps[:2]:
-                    _add(f"{pw}{sep}", "chain")
-                    for num in nums[:3]:
-                        _add(f"{pw}{sep}{num}", "chain")
 
-        # Known passwords as-is
+        # Known passwords as-is + tiny mutation envelope
         for pw in KNOWN_PASSWORDS:
+            if _source_full("known"):
+                break
             _add(pw, "known")
+            for sep in pref_seps[:2]:
+                _add(f"{pw}{sep}", "known")
+            for n in nums[:3]:
+                _add(f"{pw}{n}", "known")
 
-        # LLM candidates (if any were generated in a previous run)
+        # LLM candidates (if any were generated)
         for pw in LLM_CANDIDATES:
+            if _source_full("llm"):
+                break
             _add(pw, "llm")
+            if theme_aggressive:
+                for v in case_variants(pw)[:2]:
+                    _add(v, "llm")
+                for n in nums[:2]:
+                    _add(f"{pw}{n}", "llm")
 
-        # --- Expand each word tier ---
+        # --- Tier pools ---
         critical = WORD_TIERS.get("critical", [])
         high = WORD_TIERS.get("high", [])
         medium = WORD_TIERS.get("medium", [])
         low = WORD_TIERS.get("low", [])
-        top_words = (critical + high)[:12]
+        top_words = (critical + high)[:16]
 
         leet_max = (
             10 if leet_pct >= 0.5 else
-            5 if leet_pct >= 0.2 else
-            2
+            6 if leet_pct >= 0.2 else
+            3
         )
 
-        # --- Template-driven pass (higher precision, early) ---
-        def _render_template(template: str, w1: str, w2: str, num: str, sep: str) -> str:
-            words = [w1, w2]
+        # --- Template-driven pass (higher precision, earlier than broad loops) ---
+        def _render_template(template: str, words: list[str], num: str, sep: str) -> str:
             idx = 0
+            unresolved = False
+
             def repl(m):
-                nonlocal idx
+                nonlocal idx, unresolved
                 tok = m.group(1)
                 if tok.startswith("word"):
+                    if not words:
+                        unresolved = True
+                        return ""
                     base = words[min(idx, len(words) - 1)]
                     idx += 1
                     if tok == "word_lower":
@@ -706,6 +746,7 @@ _FALLBACK_ENGINE = textwrap.dedent('''\
                         return base.upper()
                     if tok == "word_cap":
                         return base.capitalize()
+                    # word_mixed or unknown word_* variant
                     return case_variants(base)[0]
                 if tok.startswith("year"):
                     return num if len(num) == 4 else (num[-2:] if len(num) >= 2 else "24")
@@ -713,83 +754,100 @@ _FALLBACK_ENGINE = textwrap.dedent('''\
                     return num[-2:] if len(num) >= 2 else num
                 if tok == "special":
                     return sep
+                unresolved = True
                 return ""
-            return re.sub(r"\\{(\\w+)\\}", repl, template)
 
-        if PATTERN_TEMPLATES and top_words:
-            for tmpl in PATTERN_TEMPLATES[:10]:
-                for w1 in top_words[:8]:
-                    for w2 in top_words[:6]:
-                        if w1.lower() == w2.lower():
-                            continue
-                        for num in nums[:8]:
-                            for sep in pref_seps[:2]:
-                                pw = _render_template(tmpl, w1, w2, num, sep)
-                                if pw:
-                                    _add(pw, "template")
+            out = re.sub(r"\\{(\\w+)\\}", repl, template)
+            if unresolved or ("{" in out or "}" in out):
+                return ""
+            return out
 
-        # Critical + high words: full expansion
+        if PATTERN_TEMPLATES and top_words and not _source_full("template"):
+            for tmpl in PATTERN_TEMPLATES[:14]:
+                if _source_full("template"):
+                    break
+                for w1, w2 in itertools.permutations(top_words[:10], 2):
+                    if w1.lower() == w2.lower():
+                        continue
+                    words = [w1, w2, w1]
+                    for num in nums[:8]:
+                        for sep in sep_pool[:3]:
+                            pw = _render_template(tmpl, words, num, sep)
+                            if pw:
+                                _add(pw, "template")
+                                if theme_aggressive:
+                                    _add(pw.lower(), "template")
+
+        # --- Word expansion by tier ---
         for word in critical + high:
-            for variant in case_variants(word):
+            if _source_full("critical"):
+                break
+            for variant in case_variants(word)[:4]:
                 _add(variant, "critical")
-                for num in nums[:12]:
+                for num in nums[:10]:
                     _add(f"{variant}{num}", "critical")
-                    for sep in wseps:
+                    for sep in sep_pool[:4]:
                         _add(f"{variant}{sep}{num}", "critical")
-                for sep in wseps:
+                for sep in sep_pool[:4]:
                     _add(f"{variant}{sep}", "critical")
 
             if leet_pct >= 0.1:
                 for leet in leet_variants(word, max_variants=leet_max):
                     _add(leet, "critical")
-                    for num in nums[:8]:
+                    for num in nums[:7]:
                         _add(f"{leet}{num}", "critical")
-                    for sep in wseps[:3]:
+                    for sep in sep_pool[:3]:
                         _add(f"{leet}{sep}", "critical")
-                        for num in nums[:5]:
+                        for num in nums[:4]:
                             _add(f"{leet}{sep}{num}", "critical")
 
-        # Medium words: lighter expansion
         for word in medium:
-            for variant in case_variants(word):
+            if _source_full("medium"):
+                break
+            for variant in case_variants(word)[:3]:
                 _add(variant, "medium")
                 for num in nums[:6]:
                     _add(f"{variant}{num}", "medium")
-                for sep in pref_seps[:2]:
+                for sep in sep_pool[:2]:
                     _add(f"{variant}{sep}", "medium")
 
-        # Low words: minimal
         for word in low:
+            if _source_full("low"):
+                break
             _add(word.capitalize(), "low")
             _add(word.lower(), "low")
             for num in nums[:3]:
                 _add(f"{word.capitalize()}{num}", "low")
 
-        # --- Two-word combos (critical + high only) ---
-        combo_words = (critical + high)[:15]
-        for w1, w2 in itertools.permutations(combo_words[:10], 2):
-            for sep in pref_seps[:3]:
+        # --- Two-word combos ---
+        combo_words = (critical + high)[:18]
+        for w1, w2 in itertools.permutations(combo_words[:12], 2):
+            if _source_full("combo"):
+                break
+            for sep in sep_pool[:3]:
                 combo = f"{w1.capitalize()}{sep}{w2.capitalize()}"
                 _add(combo, "combo")
                 for num in nums[:5]:
                     _add(f"{combo}{num}", "combo")
             camel = f"{w1.capitalize()}{w2.capitalize()}"
             _add(camel, "combo")
-            for num in nums[:3]:
+            for num in nums[:4]:
                 _add(f"{camel}{num}", "combo")
             if leet_pct >= 0.2:
                 for lv in leet_variants(camel, max_variants=3):
                     _add(lv, "combo")
 
         # --- Glue word combos ---
-        if GLUE_WORDS:
-            for word in combo_words[:10]:
-                for glue in GLUE_WORDS[:6]:
+        if GLUE_WORDS and not _source_full("glue"):
+            for word in combo_words[:12]:
+                if _source_full("glue"):
+                    break
+                for glue in GLUE_WORDS[:8]:
                     base = f"{word.capitalize()}{glue.capitalize()}"
                     _add(base, "glue")
                     for num in nums[:4]:
                         _add(f"{base}{num}", "glue")
-                    for sep in pref_seps[:2]:
+                    for sep in sep_pool[:2]:
                         sg = f"{word.capitalize()}{sep}{glue.capitalize()}"
                         _add(sg, "glue")
                         for num in nums[:3]:
@@ -797,13 +855,17 @@ _FALLBACK_ENGINE = textwrap.dedent('''\
 
         # --- Email/username based ---
         for email in EMAILS:
+            if _source_full("account"):
+                break
             user = email.split("@")[0]
             _add(user, "account")
             for num in nums[:5]:
                 _add(f"{user}{num}", "account")
 
         for uname in USERNAMES:
-            for variant in case_variants(uname):
+            if _source_full("account"):
+                break
+            for variant in case_variants(uname)[:3]:
                 _add(variant, "account")
                 for num in nums[:5]:
                     _add(f"{variant}{num}", "account")
@@ -1116,6 +1178,37 @@ def _build_data_constants(
 # SCRIPT GENERATION
 # ============================================================================
 
+def _escape_for_script_template(text: str) -> str:
+    """Escape braces so injected code survives _SCRIPT_SKELETON.format()."""
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+def _safe_format_script(data: dict) -> str:
+    """Safely format the script skeleton with auto-escape for stray placeholders.
+
+    If _SCRIPT_SKELETON accidentally contains a placeholder not present in
+    ``data`` (e.g. from literal braces in embedded code), treat it as a literal
+    brace expression instead of raising KeyError.
+    """
+    template = _SCRIPT_SKELETON
+    formatter = string.Formatter()
+    known = set(data.keys())
+
+    # Iteratively escape unknown placeholders until template is safe.
+    for _ in range(16):
+        unknown: set[str] = set()
+        for _, field_name, _, _ in formatter.parse(template):
+            if field_name and field_name not in known:
+                unknown.add(field_name)
+        if not unknown:
+            return template.format(**data)
+        for field_name in unknown:
+            template = template.replace("{" + field_name + "}", "{{" + field_name + "}}")
+
+    # Hard fallback: one final attempt to surface any formatting issue.
+    return template.format(**data)
+
+
 def generate_script(
     profile: TargetProfile,
     analysis: PatternAnalysis,
@@ -1158,7 +1251,7 @@ def generate_script(
         leet_exhaustive=leet_exhaustive,
     )
     data["generation_engine"] = _FALLBACK_ENGINE
-    return _SCRIPT_SKELETON.format(**data)
+    return _safe_format_script(data)
 
 
 def generate_script_llm(
@@ -1205,7 +1298,7 @@ def generate_script_llm(
         data["generation_engine"] = custom_code
     else:
         data["generation_engine"] = _FALLBACK_ENGINE
-    return _SCRIPT_SKELETON.format(**data)
+    return _safe_format_script(data)
 
 
 def build_intelligence_summary(

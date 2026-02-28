@@ -916,25 +916,48 @@ def add(
     )
 
     console.print("[dim]Generating target folder...[/dim]")
-    result_dir = write_target_folder(
-        target_dir,
-        profile,
-        analysis,
-        target_name=name,
-        llm_model=llm_model,
-        llm_candidates=llm_candidates,
-        custom_code=custom_code,
-        raw_text=raw_text,
-        min_length=min_length,
-        max_length=max_length,
-        require_upper=require_upper,
-        require_lower=require_lower,
-        require_digit=require_digit,
-        require_special=require_special,
-        custom_specials=specials,
-        leet_override=leet_override,
-        leet_exhaustive=leet_exhaustive,
-    )
+    try:
+        result_dir = write_target_folder(
+            target_dir,
+            profile,
+            analysis,
+            target_name=name,
+            llm_model=llm_model,
+            llm_candidates=llm_candidates,
+            custom_code=custom_code,
+            raw_text=raw_text,
+            min_length=min_length,
+            max_length=max_length,
+            require_upper=require_upper,
+            require_lower=require_lower,
+            require_digit=require_digit,
+            require_special=require_special,
+            custom_specials=specials,
+            leet_override=leet_override,
+            leet_exhaustive=leet_exhaustive,
+        )
+    except Exception as exc:
+        console.print(f"[yellow]Generation failed with custom engine:[/] {exc}")
+        console.print("[dim]Retrying automatically with built-in engine...[/dim]")
+        result_dir = write_target_folder(
+            target_dir,
+            profile,
+            analysis,
+            target_name=name,
+            llm_model=llm_model,
+            llm_candidates=llm_candidates,
+            custom_code=None,
+            raw_text=raw_text,
+            min_length=min_length,
+            max_length=max_length,
+            require_upper=require_upper,
+            require_lower=require_lower,
+            require_digit=require_digit,
+            require_special=require_special,
+            custom_specials=specials,
+            leet_override=leet_override,
+            leet_exhaustive=leet_exhaustive,
+        )
 
     console.print()
     console.print(Panel.fit(
@@ -1383,26 +1406,50 @@ def analyze(
     )
 
     cached_steps.append("targeted_candidates")
-    write_target_folder(
-        target_dir,
-        profile,
-        analysis,
-        target_name=name,
-        llm_model=llm_model,
-        llm_candidates=llm_candidates,
-        custom_code=custom_code,
-        raw_text=raw_text,
-        min_length=min_length,
-        max_length=max_length,
-        require_upper=require_upper,
-        require_lower=require_lower,
-        require_digit=require_digit,
-        require_special=require_special,
-        custom_specials=specials,
-        cached_steps=cached_steps,
-        leet_override=leet_override,
-        leet_exhaustive=leet_exhaustive,
-    )
+    try:
+        write_target_folder(
+            target_dir,
+            profile,
+            analysis,
+            target_name=name,
+            llm_model=llm_model,
+            llm_candidates=llm_candidates,
+            custom_code=custom_code,
+            raw_text=raw_text,
+            min_length=min_length,
+            max_length=max_length,
+            require_upper=require_upper,
+            require_lower=require_lower,
+            require_digit=require_digit,
+            require_special=require_special,
+            custom_specials=specials,
+            cached_steps=cached_steps,
+            leet_override=leet_override,
+            leet_exhaustive=leet_exhaustive,
+        )
+    except Exception as exc:
+        console.print(f"[yellow]Generation failed with custom engine:[/] {exc}")
+        console.print("[dim]Retrying automatically with built-in engine...[/dim]")
+        write_target_folder(
+            target_dir,
+            profile,
+            analysis,
+            target_name=name,
+            llm_model=llm_model,
+            llm_candidates=llm_candidates,
+            custom_code=None,
+            raw_text=raw_text,
+            min_length=min_length,
+            max_length=max_length,
+            require_upper=require_upper,
+            require_lower=require_lower,
+            require_digit=require_digit,
+            require_special=require_special,
+            custom_specials=specials,
+            cached_steps=cached_steps,
+            leet_override=leet_override,
+            leet_exhaustive=leet_exhaustive,
+        )
 
     console.print(f"\n[bold green]Re-analysis complete.[/bold green] Script regenerated at:")
     console.print(f"  [cyan]{target_dir / 'generate_passwords.py'}[/cyan]")
