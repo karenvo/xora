@@ -11,6 +11,7 @@ import httpx
 from xora.llm.base import (
     BASE_WORDS_CURATE_PROMPT,
     CODE_GENERATION_PROMPT,
+    CODE_REVIEW_PROMPT,
     CORRELATION_ANALYSIS_PROMPT,
     CROSS_REFERENCE_PROMPT,
     LLMProvider,
@@ -19,6 +20,8 @@ from xora.llm.base import (
     PATTERN_ANALYZE_PROMPT,
     PROFILE_INFERENCE_PROMPT,
     PROFILE_PARSE_PROMPT,
+    TARGETED_CANDIDATES_PROMPT,
+    _parse_candidates_response,
 )
 
 log = logging.getLogger(__name__)
@@ -287,14 +290,14 @@ class AnthropicProvider(LLMProvider):
             return {"base_words": [], "reasoning": ""}
 
     # ------------------------------------------------------------------
-    # Code generation
+    # Targeted candidate generation
     # ------------------------------------------------------------------
 
-    def generate_custom_code(
+    def generate_targeted_candidates(
         self,
         intelligence: dict,
-    ) -> str:
-        """Write custom generate_all() code tailored to this target."""
+    ) -> list[str]:
+        """Generate psychologically-targeted password candidates as a JSON list."""
         strength = intelligence.get("strength_tier", "unknown")
         leet_pct = intelligence.get("leet_usage_pct", 0.0)
         avg_length = intelligence.get("avg_length", 12)
@@ -308,34 +311,90 @@ class AnthropicProvider(LLMProvider):
         )[:5] if cat_weights else []
         top_categories = ", ".join(f"{c[0]} ({c[1]:.0%})" for c in top_cats) or "unknown"
 
-        if strength == "weak":
-            strength_guidance = "generate simple passwords: single words + short numbers"
-        elif strength == "strong":
-            strength_guidance = "generate complex passwords: multi-word compounds, deep leet"
-        else:
-            strength_guidance = "generate balanced passwords: word + separator + number combos"
+        strength_guidance = {
+            "weak": "suggest simple guesses: single words + short numbers",
+            "strong": "suggest complex guesses: multi-word compounds, leet-heavy, separators",
+        }.get(strength, "suggest balanced guesses: word + separator + number combos")
 
-        if leet_pct >= 0.5:
-            leet_guidance = "apply aggressive leet to most candidates using LEET_MAP"
-        elif leet_pct >= 0.2:
-            leet_guidance = "apply selective leet to about half the candidates"
-        else:
-            leet_guidance = "minimal or no leet — keep most passwords clean"
-
-        theme_lines = []
-        for cat_name, _ in top_cats:
-            theme_lines.append(
-                f"   - {cat_name.upper()}: combine relevant {cat_name} words from the pool"
-            )
-        if not theme_lines:
-            theme_lines.append("   - Combine critical and high-tier words with numbers and separators")
+        leet_guidance = (
+            "apply aggressive leet to most candidates" if leet_pct >= 0.5 else
+            "apply selective leet to about half the candidates" if leet_pct >= 0.2 else
+            "minimal leet — keep most passwords clean"
+        )
 
         compact_intel = {
-            "word_tier_counts": {k: len(v) for k, v in word_tiers.items()},
+            "word_tier_samples": {k: v[:10] for k, v in word_tiers.items()},
+            "known_passwords": intelligence.get("known_passwords", [])[:20],
+            "pattern_templates": intelligence.get("pattern_templates", [])[:10],
+            "cap_style": cap_style,
+            "cap_patterns": intelligence.get("cap_patterns", {}),
+            "avg_length": avg_length,
+            "preferred_separators": pref_seps,
+            "strength_tier": strength,
+            "leet_usage_pct": leet_pct,
+            "leet_map": intelligence.get("leet_map", {}),
+            "glue_words": intelligence.get("glue_words", [])[:10],
+            "semantic_templates": intelligence.get("semantic_templates", [])[:8],
+            "category_weights": cat_weights,
+            "derivation_chains": intelligence.get("derivation_chains", [])[:5],
+        }
+
+        prompt = TARGETED_CANDIDATES_PROMPT.format(
+            intelligence_json=json.dumps(compact_intel, separators=(",", ":")),
+            strength_tier=strength,
+            strength_guidance=strength_guidance,
+            leet_pct=leet_pct,
+            leet_guidance=leet_guidance,
+            preferred_seps=json.dumps(pref_seps),
+            avg_length=avg_length,
+            top_categories=top_categories,
+            cap_style=cap_style,
+        )
+
+        response = self._message(prompt, temperature=0.4, max_tokens=4096)
+        return _parse_candidates_response(response)
+
+    # ------------------------------------------------------------------
+    # Code generation (Claude is reliable enough to run directly)
+    # ------------------------------------------------------------------
+
+    def generate_custom_code(self, intelligence: dict) -> str:
+        """Write custom generate_all() Python code tailored to this target."""
+        strength = intelligence.get("strength_tier", "unknown")
+        leet_pct = intelligence.get("leet_usage_pct", 0.0)
+        avg_length = intelligence.get("avg_length", 12)
+        pref_seps = intelligence.get("preferred_separators", [])
+        cap_style = intelligence.get("cap_style", "mixed")
+        cat_weights = intelligence.get("category_weights", {})
+        word_tiers = intelligence.get("word_tiers", {})
+
+        top_cats = sorted(
+            cat_weights.items(), key=lambda x: x[1], reverse=True
+        )[:5] if cat_weights else []
+        top_categories = ", ".join(f"{c[0]} ({c[1]:.0%})" for c in top_cats) or "unknown"
+
+        strength_guidance = {
+            "weak": "generate simple passwords: single words + short numbers",
+            "strong": "generate complex passwords: multi-word compounds, deep leet",
+        }.get(strength, "generate balanced passwords: word + separator + number combos")
+
+        leet_guidance = (
+            "apply aggressive leet to most candidates using LEET_MAP[c][0]" if leet_pct >= 0.5 else
+            "apply selective leet to about half the candidates" if leet_pct >= 0.2 else
+            "minimal or no leet — keep most passwords clean"
+        )
+
+        theme_lines = [
+            f"   - {cat.upper()}: combine relevant {cat} words from the word pool"
+            for cat, _ in top_cats
+        ] or ["   - Combine critical and high-tier words with numbers and separators"]
+
+        compact_intel = {
             "word_tier_samples": {k: v[:8] for k, v in word_tiers.items()},
             "known_passwords": intelligence.get("known_passwords", [])[:15],
             "pattern_templates": intelligence.get("pattern_templates", [])[:10],
             "cap_style": cap_style,
+            "cap_patterns": intelligence.get("cap_patterns", {}),
             "avg_length": avg_length,
             "preferred_separators": pref_seps,
             "rare_separators": intelligence.get("rare_separators", []),
@@ -343,8 +402,9 @@ class AnthropicProvider(LLMProvider):
             "leet_usage_pct": leet_pct,
             "leet_map": intelligence.get("leet_map", {}),
             "glue_words": intelligence.get("glue_words", [])[:10],
-            "semantic_templates": intelligence.get("semantic_templates", [])[:10],
+            "semantic_templates": intelligence.get("semantic_templates", [])[:8],
             "category_weights": cat_weights,
+            "derivation_chains": intelligence.get("derivation_chains", [])[:5],
         }
 
         prompt = CODE_GENERATION_PROMPT.format(
@@ -364,7 +424,25 @@ class AnthropicProvider(LLMProvider):
         code = self._extract_code(response)
 
         if "def generate_all" not in code:
-            log.warning("LLM code generation did not produce generate_all() — using fallback")
+            log.warning("Anthropic code generation did not produce generate_all() — using fallback")
             return ""
-
         return code
+
+    # ------------------------------------------------------------------
+    # Code review — fixes bugs in code produced by local models (Ollama)
+    # ------------------------------------------------------------------
+
+    def review_generated_code(
+        self,
+        code: str,
+        globals_schema: dict | None = None,
+    ) -> str:
+        """Review and fix Ollama-generated generate_all() code."""
+        prompt = CODE_REVIEW_PROMPT.format(code=code)
+        response = self._message(prompt, temperature=0.1, max_tokens=8192)
+        corrected = self._extract_code(response)
+
+        if "def generate_all" not in corrected:
+            log.warning("Anthropic code review returned code without generate_all() — keeping original")
+            return code
+        return corrected

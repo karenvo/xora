@@ -18,6 +18,8 @@ from xora.llm.base import (
     PATTERN_ANALYZE_PROMPT,
     PROFILE_INFERENCE_PROMPT,
     PROFILE_PARSE_PROMPT,
+    TARGETED_CANDIDATES_PROMPT,
+    _parse_candidates_response,
 )
 
 log = logging.getLogger(__name__)
@@ -286,14 +288,14 @@ class OllamaProvider(LLMProvider):
             return {"base_words": [], "reasoning": ""}
 
     # ------------------------------------------------------------------
-    # Code generation
+    # Targeted candidate generation
     # ------------------------------------------------------------------
 
-    def generate_custom_code(
+    def generate_targeted_candidates(
         self,
         intelligence: dict,
-    ) -> str:
-        """Write custom generate_all() code tailored to this target."""
+    ) -> list[str]:
+        """Generate psychologically-targeted password candidates as a JSON list."""
         strength = intelligence.get("strength_tier", "unknown")
         leet_pct = intelligence.get("leet_usage_pct", 0.0)
         avg_length = intelligence.get("avg_length", 12)
@@ -307,94 +309,35 @@ class OllamaProvider(LLMProvider):
         )[:5] if cat_weights else []
         top_categories = ", ".join(f"{c[0]} ({c[1]:.0%})" for c in top_cats) or "unknown"
 
-        if strength == "weak":
-            strength_guidance = (
-                "generate simple passwords: single words + short numbers, "
-                "minimal separators, fewer combinations"
-            )
-        elif strength == "strong":
-            strength_guidance = (
-                "generate complex passwords: multi-word compounds, "
-                "deep leet, multiple separators + numbers"
-            )
-        else:
-            strength_guidance = (
-                "generate balanced passwords: word + separator + number combos, "
-                "moderate leet speak"
-            )
+        strength_guidance = {
+            "weak": "suggest simple guesses: single words + short numbers",
+            "strong": "suggest complex guesses: multi-word compounds, leet-heavy, separators",
+        }.get(strength, "suggest balanced guesses: word + separator + number combos")
 
-        if leet_pct >= 0.5:
-            leet_guidance = (
-                "apply aggressive leet to most candidates. Use the LEET_MAP "
-                "substitutions heavily. Generate many leet variants."
-            )
-        elif leet_pct >= 0.2:
-            leet_guidance = (
-                "apply selective leet to about half the candidates. "
-                "Mix leet and clean versions."
-            )
-        else:
-            leet_guidance = (
-                "minimal or no leet. Keep most passwords clean. "
-                "Only apply leet to a small fraction."
-            )
-
-        theme_lines = []
-        for cat_name, weight in top_cats:
-            if cat_name == "music":
-                theme_lines.append(
-                    "   - MUSIC is a primary theme: combine band names, "
-                    "songs, artists with years and glue words"
-                )
-            elif cat_name == "family":
-                theme_lines.append(
-                    "   - FAMILY is important: combine partner/pet/child names "
-                    "with years, emotions, and separators"
-                )
-            elif cat_name == "nature":
-                theme_lines.append(
-                    "   - NATURE/OUTDOORS: combine trail/park/outdoor words "
-                    "with place names and activity terms"
-                )
-            elif cat_name == "sports":
-                theme_lines.append(
-                    "   - SPORTS: combine team names, athlete names with "
-                    "numbers and victory-related words"
-                )
-            elif cat_name == "tech":
-                theme_lines.append(
-                    "   - TECH: combine hacker/programming terms with "
-                    "numbers and special characters"
-                )
-            else:
-                theme_lines.append(
-                    f"   - {cat_name.upper()}: combine relevant {cat_name} "
-                    f"words from the word pool"
-                )
-        if not theme_lines:
-            theme_lines.append(
-                "   - Combine critical and high-tier words with numbers "
-                "and separators based on detected patterns"
-            )
+        leet_guidance = (
+            "apply aggressive leet to most candidates" if leet_pct >= 0.5 else
+            "apply selective leet to about half the candidates" if leet_pct >= 0.2 else
+            "minimal leet — keep most passwords clean"
+        )
 
         compact_intel = {
-            "word_tier_counts": {k: len(v) for k, v in word_tiers.items()},
-            "word_tier_samples": {k: v[:8] for k, v in word_tiers.items()},
-            "known_passwords": intelligence.get("known_passwords", [])[:15],
+            "word_tier_samples": {k: v[:10] for k, v in word_tiers.items()},
+            "known_passwords": intelligence.get("known_passwords", [])[:20],
             "pattern_templates": intelligence.get("pattern_templates", [])[:10],
             "cap_style": cap_style,
+            "cap_patterns": intelligence.get("cap_patterns", {}),
             "avg_length": avg_length,
             "preferred_separators": pref_seps,
-            "rare_separators": intelligence.get("rare_separators", []),
             "strength_tier": strength,
             "leet_usage_pct": leet_pct,
             "leet_map": intelligence.get("leet_map", {}),
             "glue_words": intelligence.get("glue_words", [])[:10],
-            "semantic_templates": intelligence.get("semantic_templates", [])[:10],
+            "semantic_templates": intelligence.get("semantic_templates", [])[:8],
             "category_weights": cat_weights,
+            "derivation_chains": intelligence.get("derivation_chains", [])[:5],
         }
 
-        prompt = CODE_GENERATION_PROMPT.format(
+        prompt = TARGETED_CANDIDATES_PROMPT.format(
             intelligence_json=json.dumps(compact_intel, indent=2),
             strength_tier=strength,
             strength_guidance=strength_guidance,
@@ -404,14 +347,7 @@ class OllamaProvider(LLMProvider):
             avg_length=avg_length,
             top_categories=top_categories,
             cap_style=cap_style,
-            theme_specific_instructions="\n".join(theme_lines),
         )
 
-        response = self._generate(prompt, temperature=0.3)
-        code = self._extract_code(response)
-
-        if "def generate_all" not in code:
-            log.warning("LLM code generation did not produce generate_all() — using fallback")
-            return ""
-
-        return code
+        response = self._generate(prompt, temperature=0.4)
+        return _parse_candidates_response(response)

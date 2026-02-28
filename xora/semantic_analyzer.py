@@ -35,6 +35,7 @@ class SemanticComponent:
     role: str       # band_name, song, artist, pet_name, place, glue, sep, year, number, etc.
     source: str     # which profile field or password context it came from
     original: str   # the original (possibly leet-encoded) form
+    was_leet: bool = False  # whether this component was leet-encoded in the original
 
     def to_dict(self) -> dict:
         return {
@@ -42,6 +43,7 @@ class SemanticComponent:
             "role": self.role,
             "source": self.source,
             "original": self.original,
+            "was_leet": self.was_leet,
         }
 
 
@@ -348,43 +350,139 @@ def analyze_semantics_rule_based(
 
 
 # =========================================================================
+# LEET-DECODE PRE-PROCESSING FOR LLM
+# =========================================================================
+
+def _leet_substitutions(original: str, decoded: str) -> dict[str, str]:
+    """Return a map of leet chars → their decoded replacements for this password.
+
+    Compares the original and decoded strings character-by-character to find
+    which positions actually changed, then records the substitution.
+    """
+    subs: dict[str, str] = {}
+    # Walk character-by-character where lengths may differ (deleet can collapse)
+    # Use the shorter length as a safe bound; we just want the substitution set.
+    for o, d in zip(original, decoded):
+        if o != d and not o.isalpha() and d.isalpha():
+            subs[o] = d
+    return subs
+
+
+def prepare_for_semantic_llm(decoded_passwords: list[dict]) -> tuple[list[dict], dict]:
+    """Pre-process decoded passwords for the semantic LLM call.
+
+    Returns:
+        (deduplicated_entries, leet_fingerprint)
+
+    Each entry in deduplicated_entries has:
+        original    — the raw password
+        decoded     — leet-decoded plaintext
+        words       — extracted word tokens
+        was_leet    — True if any leet substitution was detected
+        leet_subs   — dict of leet char → decoded char for this password
+        variants    — list of other originals that decoded to the same base
+
+    leet_fingerprint summarises leet behaviour across all passwords:
+        used_pct    — fraction of passwords that use leet
+        substitutions — frequency-sorted list of {"from": char, "to": char, "count": n}
+    """
+    # Group by decoded base to dedup
+    seen: dict[str, dict] = {}  # decoded -> entry
+
+    all_sub_counts: dict[str, dict[str, int]] = {}  # from_char -> {to_char: count}
+    leet_count = 0
+
+    for pw in decoded_passwords:
+        original = pw.get("original", "")
+        decoded = pw.get("decoded", original)
+        words = pw.get("words", [])
+
+        subs = _leet_substitutions(original, decoded)
+        was_leet = bool(subs)
+
+        if was_leet:
+            leet_count += 1
+            for from_char, to_char in subs.items():
+                if from_char not in all_sub_counts:
+                    all_sub_counts[from_char] = {}
+                all_sub_counts[from_char][to_char] = (
+                    all_sub_counts[from_char].get(to_char, 0) + 1
+                )
+
+        # Use decoded as dedup key (normalised to lowercase)
+        key = decoded.lower()
+        if key in seen:
+            seen[key]["variants"].append(original)
+        else:
+            seen[key] = {
+                "original": original,
+                "decoded": decoded,
+                "words": words,
+                "was_leet": was_leet,
+                "leet_subs": subs,
+                "variants": [],
+            }
+
+    total = len(decoded_passwords)
+    sub_list = sorted(
+        [
+            {"from": fc, "to": list(tc.keys())[0], "count": sum(tc.values())}
+            for fc, tc in all_sub_counts.items()
+        ],
+        key=lambda x: x["count"],
+        reverse=True,
+    )
+
+    leet_fingerprint = {
+        "used_pct": round(leet_count / total, 2) if total else 0.0,
+        "substitutions": sub_list,
+    }
+
+    return list(seen.values()), leet_fingerprint
+
+
+# =========================================================================
 # LLM-BASED SEMANTIC DECOMPOSITION
 # =========================================================================
 
 SEMANTIC_DECOMPOSITION_PROMPT = """\
-You are a red team password psychologist performing SEMANTIC DECOMPOSITION. \
-For each password below, break it into meaningful components and assign a \
-SEMANTIC ROLE to each piece.
+You are a red team password psychologist performing SEMANTIC DECOMPOSITION.
 
-DECODED PASSWORDS (original + decoded form + extracted words):
+All passwords below have already been leet-decoded for you. Work only with the \
+decoded forms — do NOT try to re-decode leet. The leet fingerprint is provided \
+separately so you can focus entirely on MEANING.
+
+LEET FINGERPRINT (for your reference only — do not decode, just use context):
+{leet_json}
+
+DECODED PASSWORDS (ready to decompose):
 {passwords_json}
 
 PROFILE DATA (for matching components to the target's life):
 {profile_json}
 
-FOR EACH PASSWORD, decompose it like this:
+FOR EACH PASSWORD, decompose the DECODED form into semantic components:
 
-Example: "4CDCr0cks1980" decoded as "ACDCRocks1980"
+Example: decoded "ACDCRocks1980" (original "4CDCr0cks1980", was_leet: true)
 → components: [
     {{"value": "ACDC", "role": "band_name", "source": "music interest"}},
-    {{"value": "Rocks", "role": "glue", "source": "common glue word — enthusiasm"}},
+    {{"value": "Rocks", "role": "glue", "source": "enthusiasm glue"}},
     {{"value": "1980", "role": "year", "source": "album/band era year"}}
   ]
   semantic_template: "(band_name)(glue)(year)"
   category: "music"
 
-Example: "Jump!V@nH@len_1984" decoded as "Jump!VanHalen_1984"
+Example: decoded "Jump!VanHalen 1984" (original "Jump!V@nH@len_1984", was_leet: true)
 → components: [
     {{"value": "Jump", "role": "song", "source": "Van Halen song title"}},
     {{"value": "!", "role": "separator", "source": "structural"}},
     {{"value": "VanHalen", "role": "artist", "source": "band/artist name"}},
-    {{"value": "_", "role": "separator", "source": "structural"}},
     {{"value": "1984", "role": "year", "source": "album name AND year"}}
   ]
-  semantic_template: "(song)(separator)(artist)(separator)(year)"
+  semantic_template: "(song)(separator)(artist)(year)"
   category: "music"
 
-Example: "BiscuitLuvr!23" decoded as "BiscuitLuvr!23"
+Example: decoded "BiscuitLuvr!23" (original "BiscuitLuvr!23", was_leet: false)
 → components: [
     {{"value": "Biscuit", "role": "pet_name", "source": "pet_names: Biscuit"}},
     {{"value": "Luvr", "role": "glue", "source": "affection glue word"}},
@@ -423,7 +521,7 @@ how the target THINKS about combining things. Common glue patterns:
 - Identity: "Life", "Girl", "Boy", "Man", "Queen", "King"
 - Action: "Jump", "Roll", "Live", "Go", "Rock"
 - Status: "Hero", "Master", "Boss", "Pro", "God"
-Track these carefully — they'll be reused with different content words.
+Track these carefully — they will be reused with different content words.
 
 Return ONLY valid JSON — an array with one entry per password:
 [
@@ -446,12 +544,31 @@ def analyze_semantics_llm(
     profile_data: dict,
     provider: object,
 ) -> SemanticAnalysis:
-    """Analyze passwords semantically using an LLM."""
+    """Analyze passwords semantically using an LLM.
+
+    Leet-decodes and deduplicates passwords before sending to the LLM so it
+    can focus on meaning rather than character substitution noise.
+    """
     from xora.llm.base import LLMProvider
     assert isinstance(provider, LLMProvider)
 
+    prepared, leet_fingerprint = prepare_for_semantic_llm(decoded_passwords)
+
+    # Build a slim representation for the prompt — only what the LLM needs
+    prompt_passwords = [
+        {
+            "original": p["original"],
+            "decoded": p["decoded"],
+            "words": p["words"],
+            "was_leet": p["was_leet"],
+            **({"variants": p["variants"]} if p["variants"] else {}),
+        }
+        for p in prepared
+    ]
+
     prompt = SEMANTIC_DECOMPOSITION_PROMPT.format(
-        passwords_json=json.dumps(decoded_passwords, indent=2),
+        leet_json=json.dumps(leet_fingerprint, indent=2),
+        passwords_json=json.dumps(prompt_passwords, indent=2),
         profile_json=json.dumps(profile_data, indent=2),
     )
 
@@ -482,6 +599,9 @@ def analyze_semantics_llm(
     if not isinstance(results, list):
         return analyze_semantics_rule_based(decoded_passwords, profile_data)
 
+    # Build a lookup from original password -> pre-processed metadata
+    prepared_map = {p["original"]: p for p in prepared}
+
     analysis = SemanticAnalysis()
     glue_counter: dict[str, int] = {}
     role_vocab: dict[str, set[str]] = {}
@@ -490,31 +610,62 @@ def analyze_semantics_llm(
         if not isinstance(item, dict):
             continue
 
+        item_original = item.get("original", "")
+        pre = prepared_map.get(item_original, {})
+        item_was_leet = pre.get("was_leet", False)
+        leet_subs = pre.get("leet_subs", {})
+
         components = []
         for comp_data in item.get("components", []):
+            decoded_val = comp_data.get("value", "")
+            role = comp_data.get("role", "unknown")
+
+            # Reconstruct the leet form of this component's value if the
+            # password was leet-encoded — reverse the known substitutions.
+            if item_was_leet and leet_subs and decoded_val:
+                rev = {v: k for k, v in leet_subs.items()}
+                leet_val = "".join(rev.get(ch, ch) for ch in decoded_val)
+            else:
+                leet_val = decoded_val
+
+            comp_was_leet = item_was_leet and leet_val != decoded_val
+
             comp = SemanticComponent(
-                value=comp_data.get("value", ""),
-                role=comp_data.get("role", "unknown"),
+                value=decoded_val,
+                role=role,
                 source=comp_data.get("source", ""),
-                original=comp_data.get("value", ""),
+                original=leet_val,
+                was_leet=comp_was_leet,
             )
             components.append(comp)
 
-            if comp.role == "glue":
-                glue_counter[comp.value] = glue_counter.get(comp.value, 0) + 1
-            if comp.role not in ("separator", "number", "year"):
-                if comp.role not in role_vocab:
-                    role_vocab[comp.role] = set()
-                role_vocab[comp.role].add(comp.value)
+            if role == "glue":
+                glue_counter[decoded_val] = glue_counter.get(decoded_val, 0) + 1
+            if role not in ("separator", "number", "year"):
+                if role not in role_vocab:
+                    role_vocab[role] = set()
+                role_vocab[role].add(decoded_val)
 
         sp = SemanticPassword(
-            original=item.get("original", ""),
+            original=item_original,
             decoded=item.get("decoded", ""),
             components=components,
             semantic_template=item.get("semantic_template", ""),
             category=item.get("category", "unknown"),
         )
         analysis.passwords.append(sp)
+
+        # Also register any deduped variants as shallow copies pointing to
+        # the same semantic decomposition (so they appear in the report).
+        for variant_original in pre.get("variants", []):
+            variant_sp = SemanticPassword(
+                original=variant_original,
+                decoded=item.get("decoded", ""),
+                components=components,
+                semantic_template=item.get("semantic_template", ""),
+                category=item.get("category", "unknown"),
+            )
+            analysis.passwords.append(variant_sp)
 
     analysis.glue_words = sorted(
         glue_counter.keys(),

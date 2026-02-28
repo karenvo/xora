@@ -10,7 +10,7 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from xora.pattern_analyzer import PatternAnalysis
+from xora.pattern_analyzer import DerivationChain, PatternAnalysis
 from xora.profile_parser import TargetProfile
 
 # ============================================================================
@@ -43,6 +43,7 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
 
     import argparse
     import itertools
+    import random
     import re
     import sys
     from typing import Iterator
@@ -66,6 +67,10 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
     # ========================================================================
 
     CAP_STYLE = "{cap_style}"
+    # Observed capitalization pattern distribution across known passwords.
+    # Keys: all_lower | all_upper | first_only | camel | alternating | mixed
+    # Values: count of words exhibiting that pattern.
+    CAP_PATTERNS = {cap_patterns}
     AVG_LENGTH = {avg_length}
     PATTERN_TEMPLATES = {pattern_templates}
 
@@ -110,6 +115,14 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
     ROLE_VOCABULARY = {role_vocabulary}
 
     # ========================================================================
+    # DERIVATION CHAINS — detected progression sequences in known passwords
+    # Each chain has: base_word, chain_type, members, next_likely candidates
+    # Use these high-confidence candidates early in the generation pass.
+    # ========================================================================
+
+    DERIVATION_CHAINS = {derivation_chains}
+
+    # ========================================================================
     # PASSWORD POLICY
     # ========================================================================
 
@@ -128,6 +141,11 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
 
     LEET_MAP = {leet_map}
 
+    # When True, leet_variants() produces every possible substitution
+    # combination instead of sampling. Output grows exponentially — only
+    # use when the word pool is small or you want maximum coverage.
+    LEET_EXHAUSTIVE = {leet_exhaustive}
+
     # ========================================================================
     # UTILITY FUNCTIONS
     # ========================================================================
@@ -144,38 +162,110 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
         return words
 
 
+    def _apply_cap_pattern(word: str, pattern: str) -> str:
+        """Apply a named capitalization pattern to a base word."""
+        if pattern == "all_lower":
+            return word.lower()
+        if pattern == "all_upper":
+            return word.upper()
+        if pattern == "first_only":
+            return word[0].upper() + word[1:].lower() if word else word
+        if pattern == "camel":
+            # For a single word, CamelCase = capitalize; compound words produced
+            # by the combinator join two already-capitalized halves (e.g. MotleyCrue).
+            return word[0].upper() + word[1:].lower() if word else word
+        if pattern == "alternating":
+            return "".join(
+                c.upper() if i % 2 == 0 else c.lower() for i, c in enumerate(word)
+            )
+        # mixed / fallback: return as-is
+        return word
+
+
     def case_variants(word: str) -> list[str]:
-        """Generate capitalization variants biased by detected style."""
-        if CAP_STYLE == "capitalize":
-            results = [word.capitalize(), word.lower(), word]
-        elif CAP_STYLE == "upper":
-            results = [word.upper(), word.capitalize(), word]
-        elif CAP_STYLE == "lower":
-            results = [word.lower(), word.capitalize(), word]
-        else:
-            results = [word.capitalize(), word.lower(), word.upper(), word]
-        return list(dict.fromkeys(results))
+        """Generate capitalization variants weighted by observed cap patterns.
+
+        Most-frequent patterns in CAP_PATTERNS are tried first. A floor of
+        three variants (lower, capitalize, upper) is always included so
+        generation stays broad even for small password sets.
+        """
+        seen: set[str] = set()
+        results: list[str] = []
+
+        total = sum(CAP_PATTERNS.values()) if CAP_PATTERNS else 0
+
+        if total > 0:
+            for pattern, count in sorted(CAP_PATTERNS.items(), key=lambda kv: -kv[1]):
+                if count / total < 0.05 and len(results) >= 4:
+                    break
+                v = _apply_cap_pattern(word, pattern)
+                if v not in seen:
+                    seen.add(v)
+                    results.append(v)
+
+        # Always include basic fallbacks in priority order from legacy CAP_STYLE
+        for fallback in (
+            word.lower(),
+            word[0].upper() + word[1:].lower() if word else word,
+            word.upper(),
+        ):
+            if fallback not in seen:
+                seen.add(fallback)
+                results.append(fallback)
+
+        return results
 
 
     def leet_variants(word: str, max_variants: int = 5) -> list[str]:
-        """Apply leet speak substitutions matching the target's style."""
-        results = [word]
+        """Apply leet speak substitutions matching the target's style.
+
+        In exhaustive mode (LEET_EXHAUSTIVE=True) every combination of
+        substitution sites is generated via itertools.product — use for
+        maximum coverage when the word pool is small.
+
+        In sampled mode each substitution site is applied independently,
+        capped at max_variants * 3 — fast for large word pools.
+        """
         lower = word.lower()
-        for char, replacements in LEET_MAP.items():
-            if char not in lower:
-                continue
-            new_results = []
+
+        # Collect (position_in_word, original_char, leet_char) for each site
+        sites: list[tuple[int, str, str]] = []
+        for leet_char, replacements in LEET_MAP.items():
             primary = replacements[0]
-            secondaries = replacements[1:]
-            for current in results[:max_variants]:
-                new_results.append(current.replace(char, primary, 1))
-                new_results.append(current.replace(char.upper(), primary, 1))
-            for rep in secondaries:
-                for current in results[:2]:
-                    new_results.append(current.replace(char, rep, 1))
-                    new_results.append(current.replace(char.upper(), rep, 1))
-            results.extend(new_results)
-        return list(set(results))[:max_variants * 3]
+            idx = 0
+            while True:
+                pos = lower.find(leet_char, idx)
+                if pos == -1:
+                    break
+                sites.append((pos, lower[pos], primary))
+                idx = pos + 1
+
+        if not sites:
+            return [word]
+
+        if LEET_EXHAUSTIVE:
+            # Build all 2^n combos: each site is either substituted or not
+            results = set()
+            for combo in itertools.product(*[
+                (False, True) for _ in sites
+            ]):
+                chars = list(word)
+                for apply, (pos, orig, leet) in zip(combo, sites):
+                    if apply:
+                        # Preserve original case: if original was upper, leet is upper
+                        chars[pos] = leet.upper() if word[pos].isupper() else leet
+                results.add("".join(chars))
+            return sorted(results)
+        else:
+            # Sampled: apply one site at a time, cap results
+            results = [word]
+            for _pos, orig, primary in sites:
+                new_results = []
+                for current in results[:max_variants]:
+                    new_results.append(current.replace(orig, primary, 1))
+                    new_results.append(current.replace(orig.upper(), primary, 1))
+                results.extend(new_results)
+            return list(set(results))[:max_variants * 3]
 
 
     def _weighted_seps(seps: list[str], total: int = 6) -> list[str]:
@@ -220,8 +310,19 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
         return suffixes
 
 
+    # Leet chars that real password policies count as "special characters"
+    # (non-alphanumeric) — @, $, !, | are specials; 0, 3, 1, 4 are digits.
+    _LEET_SPECIALS = frozenset("@$!|+(€¡")
+    _LEET_DIGITS   = frozenset("01345789")  # leet digit substitutes
+
     def passes_policy(password: str, policy: dict) -> bool:
-        """Check if a password meets the configured policy."""
+        """Check if a password meets the configured policy.
+
+        Leet substitutions are correctly accounted for:
+          - @, $, !, | etc.  count as special characters
+          - 0, 3, 1, 4 etc.  count as digits (they ARE digits to Python too)
+          - No leet sub       counts as uppercase (must have a real A-Z)
+        """
         if len(password) < policy["min_length"]:
             return False
         if len(password) > policy["max_length"]:
@@ -230,10 +331,20 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
             return False
         if policy["require_lower"] and not any(c.islower() for c in password):
             return False
-        if policy["require_digit"] and not any(c.isdigit() for c in password):
-            return False
-        if policy["require_special"] and all(c.isalnum() for c in password):
-            return False
+        if policy["require_digit"]:
+            # c.isdigit() already covers leet digits (0,1,3,4,5,7,8,9)
+            if not any(c.isdigit() for c in password):
+                return False
+        if policy["require_special"]:
+            # A password satisfies this if it has any non-alphanumeric char
+            # (which includes leet specials like @, $, !) OR any leet-special
+            # that Python counts as alphanumeric but is used as punctuation.
+            has_special = any(
+                not c.isalnum() or c in _LEET_SPECIALS
+                for c in password
+            )
+            if not has_special:
+                return False
         return True
 
 
@@ -333,6 +444,36 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
 
         if len(specials_in_pw) > 2:
             score -= 0.1
+
+        # Cap-pattern bonus: reward passwords whose words follow the dominant
+        # observed capitalization pattern (up to +0.10).
+        if CAP_PATTERNS:
+            dominant_pattern = max(CAP_PATTERNS, key=CAP_PATTERNS.get)
+            dominant_count = CAP_PATTERNS[dominant_pattern]
+            total_cap = sum(CAP_PATTERNS.values())
+            dominant_weight = dominant_count / total_cap if total_cap else 0
+            # Only award the bonus when the pattern is genuinely dominant (>40%)
+            if dominant_weight >= 0.40:
+                import re as _re
+                alpha_words = _re.findall(r"[A-Za-z]+", password)
+                if alpha_words:
+                    # Check the longest alpha word in the password
+                    sample = max(alpha_words, key=len)
+                    alpha_chars = [c for c in sample if c.isalpha()]
+                    upper_c = sum(1 for c in alpha_chars if c.isupper())
+                    total_a = len(alpha_chars)
+                    if total_a:
+                        pw_pattern = (
+                            "all_lower" if upper_c == 0 else
+                            "all_upper" if upper_c == total_a else
+                            "first_only" if upper_c == 1 and alpha_chars[0].isupper() else
+                            "camel" if any(
+                                alpha_chars[i].islower() and alpha_chars[i + 1].isupper()
+                                for i in range(len(alpha_chars) - 1)
+                            ) else "mixed"
+                        )
+                        if pw_pattern == dominant_pattern:
+                            score += round(0.10 * dominant_weight, 3)
 
         return min(max(score, 0.0), 1.0)
 
@@ -481,6 +622,16 @@ _FALLBACK_ENGINE = textwrap.dedent('''\
             seen.add(pw)
             if passes_policy(pw, pol):
                 scored.append((score_candidate(pw), pw))
+
+        # Derivation chain next_likely candidates — highest confidence predictions
+        for chain in DERIVATION_CHAINS:
+            for pw in chain.get("next_likely", []):
+                _add(pw)
+                # Also apply case and leet variants for each chain prediction
+                for v in case_variants(pw):
+                    _add(v)
+                for lv in leet_variants(pw):
+                    _add(lv)
 
         # Known passwords as-is
         for pw in KNOWN_PASSWORDS:
@@ -792,6 +943,7 @@ def _build_data_constants(
     target_name: str,
     llm_model: str = "none",
     generation_mode: str = "fallback",
+    llm_candidates: list[str] | None = None,
     min_length: int = 8,
     max_length: int = 64,
     require_upper: bool = False,
@@ -799,6 +951,8 @@ def _build_data_constants(
     require_digit: bool = False,
     require_special: bool = False,
     custom_specials: str | None = None,
+    leet_override: float | None = None,
+    leet_exhaustive: bool = False,
 ) -> dict:
     """Build the data dictionary used to fill the script skeleton."""
     tiers = _classify_words_into_tiers(profile, analysis)
@@ -833,6 +987,7 @@ def _build_data_constants(
         "emails": json.dumps(profile.emails, indent=4),
         "usernames": json.dumps(profile.usernames, indent=4),
         "cap_style": analysis.capitalization_style,
+        "cap_patterns": json.dumps(analysis.cap_patterns, indent=4),
         "avg_length": round(analysis.avg_length, 1),
         "pattern_templates": json.dumps(analysis.unique_templates, indent=4),
         "category_weights": json.dumps(cat_weights, indent=4),
@@ -841,11 +996,12 @@ def _build_data_constants(
         "strength_tier": sp.get("tier", "unknown"),
         "strength_avg_score": round(sp.get("avg_score", 0.5), 2),
         "strength_reuse_ratio": round(sp.get("reuse_ratio", 0.0), 2),
-        "strength_leet_pct": round(sp.get("leet_usage_pct", 0.0), 2),
+        "strength_leet_pct": round(leet_override if leet_override is not None else sp.get("leet_usage_pct", 0.0), 2),
+        "leet_exhaustive": leet_exhaustive,
         "strength_always_special": sp.get("always_has_special", False),
         "strength_always_digit": sp.get("always_has_digit", False),
         "strength_always_upper": sp.get("always_has_upper", False),
-        "llm_candidates": json.dumps([], indent=4),
+        "llm_candidates": json.dumps(llm_candidates or [], indent=4),
         "llm_model": llm_model,
         "leet_map": json.dumps(leet_map, indent=4),
         "glue_words": json.dumps(glue_words, indent=4),
@@ -857,11 +1013,14 @@ def _build_data_constants(
         "require_lower": require_lower,
         "require_digit": require_digit,
         "require_special": require_special,
+        "derivation_chains": json.dumps(
+            [c.to_dict() for c in analysis.derivation_chains], indent=4
+        ),
     }
 
 
 # ============================================================================
-# SCRIPT GENERATION — two paths: LLM-driven or fallback
+# SCRIPT GENERATION
 # ============================================================================
 
 def generate_script(
@@ -870,6 +1029,7 @@ def generate_script(
     *,
     target_name: str,
     llm_model: str = "none",
+    llm_candidates: list[str] | None = None,
     min_length: int = 8,
     max_length: int = 64,
     require_upper: bool = False,
@@ -877,13 +1037,23 @@ def generate_script(
     require_digit: bool = False,
     require_special: bool = False,
     custom_specials: str | None = None,
+    leet_override: float | None = None,
+    leet_exhaustive: bool = False,
 ) -> str:
-    """Generate script using the fallback (no-LLM) engine."""
+    """Generate the standalone password script.
+
+    The combinatorial engine is always xora's own reliable template engine.
+    When an LLM is available, psychologically-targeted candidate strings are
+    injected into LLM_CANDIDATES so the engine seeds them at the top of the
+    ranked output — no LLM-written Python code involved.
+    """
+    mode = f"LLM-enhanced ({llm_model})" if llm_candidates else "no LLM"
     data = _build_data_constants(
         profile, analysis,
         target_name=target_name,
         llm_model=llm_model,
-        generation_mode="fallback (no LLM)",
+        generation_mode=mode,
+        llm_candidates=llm_candidates,
         min_length=min_length,
         max_length=max_length,
         require_upper=require_upper,
@@ -891,18 +1061,23 @@ def generate_script(
         require_digit=require_digit,
         require_special=require_special,
         custom_specials=custom_specials,
+        leet_override=leet_override,
+        leet_exhaustive=leet_exhaustive,
     )
     data["generation_engine"] = _FALLBACK_ENGINE
     return _SCRIPT_SKELETON.format(**data)
 
 
+# Keep for backward compatibility — delegates to generate_script
 def generate_script_llm(
     profile: TargetProfile,
     analysis: PatternAnalysis,
     *,
     target_name: str,
     llm_model: str = "none",
-    custom_code: str,
+    llm_candidates: list[str] | None = None,
+    # custom_code is accepted but ignored — engine is always the template
+    custom_code: str | None = None,
     min_length: int = 8,
     max_length: int = 64,
     require_upper: bool = False,
@@ -910,13 +1085,15 @@ def generate_script_llm(
     require_digit: bool = False,
     require_special: bool = False,
     custom_specials: str | None = None,
+    leet_override: float | None = None,
+    leet_exhaustive: bool = False,
 ) -> str:
-    """Generate script using LLM-written generation code."""
-    data = _build_data_constants(
+    """Deprecated shim — use generate_script() directly."""
+    return generate_script(
         profile, analysis,
         target_name=target_name,
         llm_model=llm_model,
-        generation_mode=f"LLM-driven ({llm_model})",
+        llm_candidates=llm_candidates,
         min_length=min_length,
         max_length=max_length,
         require_upper=require_upper,
@@ -924,20 +1101,20 @@ def generate_script_llm(
         require_digit=require_digit,
         require_special=require_special,
         custom_specials=custom_specials,
+        leet_override=leet_override,
+        leet_exhaustive=leet_exhaustive,
     )
-    data["generation_engine"] = custom_code
-    return _SCRIPT_SKELETON.format(**data)
 
 
 def build_intelligence_summary(
     profile: TargetProfile,
     analysis: PatternAnalysis,
 ) -> dict:
-    """Build a compact intelligence summary for LLM code generation.
+    """Build a compact intelligence summary for LLM targeted candidate generation.
 
-    This is the data package the LLM receives when writing custom
-    generate_all() code — it tells the LLM everything about the target's
-    password psychology.
+    This is the data package the LLM receives to generate psychologically-
+    targeted password candidates. The LLM returns a JSON list of strings;
+    xora's own template engine handles all combinatorial expansion.
     """
     tiers = _classify_words_into_tiers(profile, analysis)
     preferred_seps, rare_seps = _extract_separator_fingerprint(analysis)
@@ -949,6 +1126,7 @@ def build_intelligence_summary(
         "numbers": _enrich_numbers(profile, analysis),
         "known_passwords": profile.known_passwords,
         "cap_style": analysis.capitalization_style,
+        "cap_patterns": analysis.cap_patterns,
         "avg_length": round(analysis.avg_length, 1),
         "pattern_templates": analysis.unique_templates,
         "preferred_separators": preferred_seps,
@@ -964,6 +1142,7 @@ def build_intelligence_summary(
             analysis.password_profile.get("priority_weights", {})
             if analysis.password_profile else {}
         ),
+        "derivation_chains": [c.to_dict() for c in analysis.derivation_chains],
     }
 
 
@@ -978,6 +1157,8 @@ def write_target_folder(
     *,
     target_name: str,
     llm_model: str = "none",
+    llm_candidates: list[str] | None = None,
+    # custom_code kept for backward compatibility — ignored
     custom_code: str | None = None,
     raw_text: str = "",
     min_length: int = 8,
@@ -988,6 +1169,8 @@ def write_target_folder(
     require_special: bool = False,
     custom_specials: str | None = None,
     cached_steps: list[str] | None = None,
+    leet_override: float | None = None,
+    leet_exhaustive: bool = False,
 ) -> Path:
     """Create the target folder with all artifacts."""
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -1001,7 +1184,7 @@ def write_target_folder(
     profile_hash = hashlib.sha256(raw_text_final.encode()).hexdigest()
     all_steps = cached_steps or [
         "parse", "categorize", "semantics", "inference",
-        "correlations", "curate", "custom_code",
+        "correlations", "curate", "targeted_candidates",
     ]
     cache_meta = {
         "profile_hash": profile_hash,
@@ -1035,36 +1218,75 @@ def write_target_folder(
     report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
     # The main artifact: standalone generation script
-    if custom_code:
-        script = generate_script_llm(
-            profile, analysis,
-            target_name=target_name,
-            llm_model=llm_model,
-            custom_code=custom_code,
-            min_length=min_length,
-            max_length=max_length,
-            require_upper=require_upper,
-            require_lower=require_lower,
-            require_digit=require_digit,
-            require_special=require_special,
-            custom_specials=custom_specials,
-        )
-    else:
-        script = generate_script(
-            profile, analysis,
-            target_name=target_name,
-            llm_model=llm_model,
-            min_length=min_length,
-            max_length=max_length,
-            require_upper=require_upper,
-            require_lower=require_lower,
-            require_digit=require_digit,
-            require_special=require_special,
-            custom_specials=custom_specials,
-        )
+    # Always uses xora's template engine; LLM candidates seed LLM_CANDIDATES.
+    script = generate_script(
+        profile, analysis,
+        target_name=target_name,
+        llm_model=llm_model,
+        llm_candidates=llm_candidates,
+        min_length=min_length,
+        max_length=max_length,
+        require_upper=require_upper,
+        require_lower=require_lower,
+        require_digit=require_digit,
+        require_special=require_special,
+        custom_specials=custom_specials,
+        leet_override=leet_override,
+        leet_exhaustive=leet_exhaustive,
+    )
     script_path = target_dir / "generate_passwords.py"
     script_path.write_text(script, encoding="utf-8")
     script_path.chmod(0o755)
+
+    return target_dir
+
+
+def write_analysis_files(
+    target_dir: Path,
+    profile: TargetProfile,
+    analysis: PatternAnalysis,
+    *,
+    target_name: str,
+    llm_model: str = "none",
+    raw_text: str = "",
+    cached_steps: list[str] | None = None,
+) -> Path:
+    """Write analysis artifacts (profile, analysis.json, analysis.md) WITHOUT codegen.
+
+    Called at the end of the analysis phase so files are available for the
+    interactive review session before generate_passwords.py is written.
+    """
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_text_final = raw_text or profile.raw_text
+    (target_dir / "profile.raw").write_text(raw_text_final, encoding="utf-8")
+
+    profile_hash = hashlib.sha256(raw_text_final.encode()).hexdigest()
+    all_steps = cached_steps or [
+        "parse", "categorize", "semantics", "inference",
+        "correlations", "curate",
+    ]
+    cache_meta = {
+        "profile_hash": profile_hash,
+        "llm_model": llm_model,
+        "timestamp": datetime.now().isoformat(),
+        "cached_steps": all_steps,
+    }
+    (target_dir / "cache_meta.json").write_text(
+        json.dumps(cache_meta, indent=2), encoding="utf-8"
+    )
+
+    (target_dir / "profile.parsed.json").write_text(
+        json.dumps(profile.to_dict(), indent=2), encoding="utf-8"
+    )
+
+    (target_dir / "analysis.json").write_text(
+        json.dumps(analysis.to_dict(), indent=2), encoding="utf-8"
+    )
+
+    tiers = _classify_words_into_tiers(profile, analysis)
+    report_lines = _build_report(profile, analysis, tiers, target_name, llm_model)
+    (target_dir / "analysis.md").write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
     return target_dir
 

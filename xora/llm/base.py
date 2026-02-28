@@ -2,7 +2,55 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 from abc import ABC, abstractmethod
+
+log = logging.getLogger(__name__)
+
+
+def _parse_candidates_response(text: str) -> list[str]:
+    """Parse a JSON array of password strings from LLM output.
+
+    Handles common LLM formatting quirks: markdown fences, prose before/after
+    the array, and truncated JSON via bracket-recovery.
+    """
+    # Strip markdown code fences
+    text = re.sub(r"```[a-z]*\n?", "", text).strip()
+
+    # Try to find the outermost JSON array
+    start = text.find("[")
+    if start == -1:
+        log.warning("Targeted candidates response contained no JSON array")
+        return []
+
+    # Recover truncated JSON: find the last complete string entry
+    end = text.rfind("]")
+    if end != -1:
+        fragment = text[start : end + 1]
+    else:
+        # Truncated — cut back to the last complete quoted string
+        fragment = text[start:]
+        last_quote = fragment.rfind('"')
+        if last_quote > 0:
+            fragment = fragment[:last_quote + 1] + "]"
+        else:
+            return []
+
+    try:
+        data = json.loads(fragment)
+    except json.JSONDecodeError:
+        # Last resort: extract quoted strings manually
+        data = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', fragment)
+
+    if not isinstance(data, list):
+        log.warning("Targeted candidates response was not a JSON array")
+        return []
+
+    candidates = [str(p).strip() for p in data if p and isinstance(p, str) and " " not in str(p)]
+    log.debug("Parsed %d targeted candidates from LLM response", len(candidates))
+    return candidates
 
 
 class LLMProvider(ABC):
@@ -61,34 +109,54 @@ class LLMProvider(ABC):
         """Select password-relevant words from the profile."""
 
     @abstractmethod
+    def generate_targeted_candidates(
+        self,
+        intelligence: dict,
+    ) -> list[str]:
+        """Generate a list of psychologically-targeted password candidates.
+
+        The LLM receives an intelligence summary and returns a JSON list of
+        password strings — no Python code involved. The generation engine
+        (combinatorial expansion, leet application, policy filtering) is
+        handled entirely by xora's own template, which is reliable and tested.
+
+        The LLM's role here is purely *psychological*: suggest specific
+        passwords this person would likely use, informed by their themes,
+        leet habits, separator preferences, and semantic patterns.
+
+        Returns:
+            list of password strings (plain text, leet variants, combos, etc.)
+        """
+
+    @abstractmethod
     def generate_custom_code(
         self,
         intelligence: dict,
     ) -> str:
         """Write custom generate_all() Python code for this specific target.
 
-        The LLM receives an intelligence summary and writes a generate_all()
-        function that is tailored to THIS person's password psychology. The
-        function should include both hardcoded word/combo suggestions and
-        combinatorial expansion logic.
+        Returns Python source code string defining generate_all() and any
+        helpers it needs. Returns "" if code generation fails or is not
+        supported by this provider.
+        """
 
-        The returned code must define a function:
-            def generate_all(policy: dict | None = None) -> list[tuple[float, str]]:
+    @abstractmethod
+    def review_generated_code(
+        self,
+        code: str,
+        globals_schema: dict | None = None,
+    ) -> str:
+        """Review and fix LLM-generated generate_all() code.
 
-        The code can use these globals already defined in the skeleton:
-            WORD_TIERS, NUMBERS, KNOWN_PASSWORDS, EMAILS, USERNAMES,
-            CAP_STYLE, AVG_LENGTH, PATTERN_TEMPLATES, CATEGORY_WEIGHTS,
-            PREFERRED_SEPARATORS, RARE_SEPARATORS, STRENGTH_TIER,
-            STRENGTH_LEET_PCT, GLUE_WORDS, SEMANTIC_TEMPLATES,
-            ROLE_VOCABULARY, LEET_MAP, DEFAULT_POLICY
+        Receives code produced by another LLM (typically a local model) and
+        returns a corrected version that is guaranteed to:
+          - use the correct data structure types for all globals
+          - define generate_all() with the correct return type
+          - not redefine existing utility functions
+          - be syntactically valid Python
 
-        And these utility functions:
-            _all_words(), case_variants(), leet_variants(),
-            _weighted_seps(), number_suffixes(), passes_policy(),
-            score_candidate()
-
-        Returns:
-            Python source code string defining generate_all() and any helpers.
+        Returns the corrected code, or the original if no issues are found.
+        Providers that cannot perform code review should return ``code`` as-is.
         """
 
 
@@ -337,6 +405,48 @@ Return ONLY a JSON array of strings:
 """
 
 # ============================================================================
+# TARGETED CANDIDATES PROMPT
+# ============================================================================
+
+TARGETED_CANDIDATES_PROMPT = """\
+You are a red team password psychologist. Your job is to generate a list of \
+specific, psychologically-targeted password guesses for ONE person based on \
+their profile and observed password habits.
+
+═══ TARGET INTELLIGENCE ═══
+{intelligence_json}
+
+═══ YOUR TASK ═══
+
+Return a JSON array of 100-200 password strings. These should be the most \
+likely real passwords this person would choose — not random combinations, but \
+*psychologically grounded* guesses that reflect:
+
+STRATEGY:
+- Strength tier is "{strength_tier}" — {strength_guidance}
+- Leet usage is {leet_pct:.0%} — {leet_guidance}
+- Preferred separators: {preferred_seps} — use these between words
+- Average password length: {avg_length} chars — target this range
+- Top categories: {top_categories}
+- Cap style: "{cap_style}" — apply this capitalization pattern
+
+WHAT TO GENERATE:
+1. Template-filled combos: combine pool words using the detected semantic templates
+2. Leet variants: apply their specific leet substitution habits to key words
+3. Separator combos: use their preferred separators between word+number combos
+4. Context passwords: what they'd type for a bank, social media, work account
+5. Year combos: combine identity words with meaningful years from their profile
+6. Known-password mutations: variations on their existing passwords
+7. Derivation predictions: if they used "word1" → "word1!" predict "word1!1", etc.
+
+IMPORTANT:
+- Return ONLY a valid JSON array of strings — no explanation, no markdown
+- Each element is a plain password string (may include leet, numbers, specials)
+- Do NOT wrap in a function or any other structure
+- Example output: ["MotleyCrue1983!", "m0tl3ycru3!", "MC_1983", ...]
+"""
+
+# ============================================================================
 # CODE GENERATION PROMPT
 # ============================================================================
 
@@ -354,18 +464,29 @@ Write a Python function `generate_all(policy=None)` that generates password \
 candidates specifically for THIS person. The function must:
 
 1. Return `list[tuple[float, str]]` — list of (score, password) pairs
-2. Call `passes_policy(pw, pol)` to filter passwords
-3. Call `score_candidate(pw)` to score each password
-4. Use `seen: set[str]` to deduplicate
+2. Use `pol = policy or DEFAULT_POLICY` at the top
+3. Call `passes_policy(pw, pol)` to filter passwords
+4. Call `score_candidate(pw)` to score each password
+5. Use `seen: set[str]` to deduplicate
+
+CRITICAL — Global data structure types (do NOT get these wrong):
+- WORD_TIERS: dict[str, list[str]] — keys are "critical","high","medium","low"
+- LEET_MAP:   dict[str, list[str]] — values are LISTS, use LEET_MAP[c][0] or random.choice(LEET_MAP[c])
+- NUMBERS:    list[str]
+- PREFERRED_SEPARATORS, RARE_SEPARATORS: list[str]
+- CATEGORY_WEIGHTS: dict[str, float] — theme names as keys (e.g. "music", "family")
+- LLM_CANDIDATES, KNOWN_PASSWORDS, EMAILS, USERNAMES: list[str]
 
 Available globals (already defined — do NOT redefine):
 - Data: WORD_TIERS, NUMBERS, KNOWN_PASSWORDS, EMAILS, USERNAMES
-- Data: CAP_STYLE, AVG_LENGTH, PATTERN_TEMPLATES, CATEGORY_WEIGHTS
+- Data: CAP_STYLE, CAP_PATTERNS, AVG_LENGTH, PATTERN_TEMPLATES, CATEGORY_WEIGHTS
 - Data: PREFERRED_SEPARATORS, RARE_SEPARATORS, STRENGTH_TIER, STRENGTH_LEET_PCT
 - Data: GLUE_WORDS, SEMANTIC_TEMPLATES, ROLE_VOCABULARY, LEET_MAP, DEFAULT_POLICY
+- Data: LLM_CANDIDATES, DERIVATION_CHAINS
 - Funcs: _all_words(), case_variants(word), leet_variants(word, max_variants)
 - Funcs: _weighted_seps(seps, total), number_suffixes()
 - Funcs: passes_policy(pw, policy), score_candidate(pw)
+- Already imported: itertools, random, re, sys
 
 STRATEGY — Based on this person's psychology:
 - Strength tier is "{strength_tier}" — {strength_guidance}
@@ -378,29 +499,60 @@ STRATEGY — Based on this person's psychology:
 YOUR CODE MUST DO TWO THINGS:
 
 PART 1 — SUGGEST ADDITIONAL WORDS & COMBOS:
-Based on the target's profile, category weights, and password psychology, define \
-a hardcoded list of 50-150 additional password candidates inside the function. \
-These should be psychologically-targeted guesses: compound words, themed combos, \
-leet-encoded phrases, and identity-anchored passwords this person would actually \
-type. Think about:
-- Template-filling: combine pool words using their semantic templates
-- Novel combinations: words from different tiers that share psychological meaning
-- Style-matched variants: apply their leet/case/separator habits
-- Context passwords: what they'd use for bank, social media, gaming, work accounts
+Hardcode 50-100 specific password guesses inside the function that reflect \
+this person's themes, leet habits, and separator style.
 
 PART 2 — COMBINATORIAL GENERATION ENGINE:
-Write the expansion logic that uses the global word pool, numbers, separators, \
-leet map, and glue words to generate candidates. Theme-specific strategy:
+Expand the word pool using case_variants(), leet_variants(), number_suffixes(), \
+and PREFERRED_SEPARATORS. Theme-specific strategy:
 {theme_specific_instructions}
-
-Generate 50,000-200,000 candidates total (quality over quantity).
 
 IMPORTANT CONSTRAINTS:
 - Output ONLY the Python code — no markdown, no explanation
-- The code must be valid Python that runs standalone
 - Define `generate_all()` and any helper functions it needs
 - Do NOT redefine globals or utility functions (they're already available)
-- Use f-strings with double braces {{}} for literal braces in strings
-- The `_add` helper pattern is recommended for dedup + policy + scoring
-- Do NOT use `import` statements — itertools, re, sys are already imported
+- Do NOT use bare import statements — all modules are already imported
+- Use f-strings with double braces {{}} for literal braces
+"""
+
+# ============================================================================
+# CODE REVIEW PROMPT
+# ============================================================================
+
+CODE_REVIEW_PROMPT = """\
+You are a Python code reviewer. A local LLM wrote the following `generate_all()` \
+function for a password generator script. Review it for correctness and fix any \
+issues before it is used.
+
+═══ RULES TO ENFORCE ═══
+
+Data structure types (the most common source of bugs):
+- WORD_TIERS is dict[str, list[str]] — keys are ONLY "critical","high","medium","low"
+  WRONG: WORD_TIERS["music"]  RIGHT: WORD_TIERS.get("critical", [])
+- LEET_MAP is dict[str, list[str]] — values are LISTS, never plain strings
+  WRONG: variant += LEET_MAP[c]  RIGHT: variant += LEET_MAP[c][0]  or  random.choice(LEET_MAP[c])
+- NUMBERS, KNOWN_PASSWORDS, LLM_CANDIDATES, EMAILS, USERNAMES are list[str]
+- PREFERRED_SEPARATORS, RARE_SEPARATORS are list[str]
+- CATEGORY_WEIGHTS is dict[str, float] — keys are theme names like "music", "family"
+
+Function contract:
+- generate_all(policy=None) must return list[tuple[float, str]]
+- Must use pol = policy or DEFAULT_POLICY
+- Must call passes_policy(pw, pol) — do NOT rewrite this logic inline
+- Must call score_candidate(pw) — do NOT rewrite scoring logic inline
+- Must use seen: set[str] for deduplication
+
+Python rules:
+- No duplicate keyword arguments in any function call
+- No bare import statements (itertools, random, re, sys are already imported)
+- No nested function definitions that shadow global utility functions
+- Valid f-string syntax (double braces {{}} for literal braces inside f-strings)
+- No accessing list values with LEET_MAP.get(c, c) — the fallback must be a string
+
+═══ CODE TO REVIEW ═══
+{code}
+
+═══ YOUR RESPONSE ═══
+Return ONLY the corrected Python code. If no issues are found, return the original \
+code unchanged. Do not add any explanation or markdown.
 """

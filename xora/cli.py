@@ -21,8 +21,10 @@ from xora.codegen import (
     _classify_words_into_tiers,
     _extract_separator_fingerprint,
     build_intelligence_summary,
+    write_analysis_files,
     write_target_folder,
 )
+from xora.interactive import run_review_session
 from xora.password_profiler import (
     assess_strength_profile,
     build_password_profile,
@@ -337,6 +339,12 @@ def cli(ctx):
               help="Skip LLM entirely — use rule-based analysis only")
 @click.option("--api-key", default=None, envvar="XORA_API_KEY",
               help="API key for cloud LLM providers (or set XORA_API_KEY)")
+@click.option("--passwords", "input_type", flag_value="passwords",
+              help="Treat input as a plain password list (skip profile parsing)")
+@click.option("--profile-file", "input_type", flag_value="profile",
+              help="Treat input as a profile/OSINT file (override auto-detection)")
+@click.option("--yes", "-y", "skip_review", is_flag=True, default=False,
+              help="Skip interactive review and generate immediately")
 @click.option("--min-length", default=8, show_default=True, type=int,
               help="Minimum password length baked into the generated script")
 @click.option("--max-length", default=64, show_default=True, type=int,
@@ -357,6 +365,8 @@ def add(
     llm: str | None,
     no_llm: bool,
     api_key: str | None,
+    input_type: str | None,
+    skip_review: bool,
     min_length: int,
     max_length: int,
     require_upper: bool,
@@ -400,7 +410,15 @@ def add(
 
     # Parse: password-file gets special handling; everything else goes
     # through LLM-first → parser → LLM cross-reference pipeline
-    pw_only = is_password_file(raw_text)
+    if input_type == "passwords":
+        pw_only = True
+        console.print("[dim]--passwords flag: treating input as password list.[/dim]")
+    elif input_type == "profile":
+        pw_only = False
+        console.print("[dim]--profile-file flag: treating input as OSINT profile.[/dim]")
+    else:
+        pw_only = is_password_file(raw_text)
+
     if pw_only:
         console.print("[dim]Detected password list — extracting credentials...[/dim]")
         profile = _parse_password_file(raw_text)
@@ -691,54 +709,64 @@ def add(
 
     console.print(f"  Final base words: [green]{len(profile.all_base_words())}[/green]")
 
-    # --- LLM-driven code generation ---
-    custom_code: str | None = None
+    # --- Save analysis files (no codegen yet) ---
+    tiers = _classify_words_into_tiers(profile, analysis)
+    write_analysis_files(
+        target_dir, profile, analysis,
+        target_name=name, llm_model=llm_model, raw_text=raw_text,
+    )
+
+    # --- Interactive review ---
+    review = run_review_session(
+        profile, analysis, tiers, target_dir,
+        min_length=min_length, max_length=max_length,
+        require_upper=require_upper, require_lower=require_lower,
+        require_digit=require_digit, require_special=require_special,
+        specials=specials, provider=provider,
+    ) if not skip_review else {
+        "min_length": min_length, "max_length": max_length,
+        "require_upper": require_upper, "require_lower": require_lower,
+        "require_digit": require_digit, "require_special": require_special,
+        "specials": specials, "leet_override": None,
+    }
+
+    min_length = review["min_length"]
+    max_length = review["max_length"]
+    require_upper = review["require_upper"]
+    require_lower = review["require_lower"]
+    require_digit = review["require_digit"]
+    require_special = review["require_special"]
+    specials = review["specials"]
+    leet_override = review.get("leet_override")
+    leet_exhaustive = review.get("leet_exhaustive", False)
+
+    # --- LLM-driven targeted candidate generation ---
+    llm_candidates: list[str] | None = None
 
     if provider:
         intel = build_intelligence_summary(profile, analysis)
         intel["decoded_passwords"] = decoded_for_llm
         intel["profile_data"] = profile.to_dict()
         intel["correlation_insights"] = analysis.correlation_data or []
+        intel["derivation_chains"] = [c.to_dict() for c in analysis.derivation_chains]
 
-        console.print("[dim]LLM: Writing custom generation code...[/dim]")
+        console.print("[dim]LLM: Generating targeted password candidates...[/dim]")
         try:
-            custom_code = provider.generate_custom_code(intel)
-            if custom_code:
+            llm_candidates = provider.generate_targeted_candidates(intel)
+            if llm_candidates:
                 console.print(
-                    f"  [green]LLM wrote custom generate_all() "
-                    f"({len(custom_code.splitlines())} lines).[/green]"
+                    f"  [green]LLM contributed {len(llm_candidates)} targeted candidates.[/green]"
                 )
             else:
-                console.print("  [yellow]LLM code generation returned empty — using fallback engine.[/yellow]")
-                custom_code = None
+                console.print("  [yellow]LLM returned no candidates — engine will use word pool only.[/yellow]")
         except Exception as exc:
-            console.print(f"  [yellow]LLM code generation failed:[/] {exc}")
-            console.print("  [dim]Using fallback engine instead.[/dim]")
-            custom_code = None
+            console.print(f"  [yellow]LLM candidate generation failed:[/] {exc}")
+            console.print("  [dim]Engine will use word pool only.[/dim]")
     else:
         console.print(
-            "[yellow]No LLM available — using fallback generator. "
+            "[yellow]No LLM available — using combinatorial engine only. "
             "For better results, rerun with: --llm ollama[/yellow]"
         )
-
-    # Generate everything
-    policy_active = any([require_upper, require_lower, require_digit,
-                         require_special, min_length != 8, max_length != 64,
-                         specials])
-    if policy_active:
-        parts = []
-        parts.append(f"{min_length}-{max_length} chars")
-        if require_upper:
-            parts.append("upper")
-        if require_lower:
-            parts.append("lower")
-        if require_digit:
-            parts.append("digit")
-        if require_special:
-            parts.append("special")
-        if specials:
-            parts.append(f"specials: {specials}")
-        console.print(f"  Password policy: [cyan]{', '.join(parts)}[/cyan]")
 
     console.print("[dim]Generating target folder...[/dim]")
     result_dir = write_target_folder(
@@ -747,7 +775,7 @@ def add(
         analysis,
         target_name=name,
         llm_model=llm_model,
-        custom_code=custom_code,
+        llm_candidates=llm_candidates,
         raw_text=raw_text,
         min_length=min_length,
         max_length=max_length,
@@ -756,6 +784,8 @@ def add(
         require_digit=require_digit,
         require_special=require_special,
         custom_specials=specials,
+        leet_override=leet_override,
+        leet_exhaustive=leet_exhaustive,
     )
 
     console.print()
@@ -784,6 +814,12 @@ def add(
               help="Force full re-analysis, ignoring cached results")
 @click.option("--api-key", default=None, envvar="XORA_API_KEY",
               help="API key for cloud LLM providers")
+@click.option("--passwords", "input_type", flag_value="passwords",
+              help="Treat profile.raw as a plain password list")
+@click.option("--profile-file", "input_type", flag_value="profile",
+              help="Treat profile.raw as a profile/OSINT file (override auto-detection)")
+@click.option("--yes", "-y", "skip_review", is_flag=True, default=False,
+              help="Skip interactive review and generate immediately")
 @click.option("--min-length", default=8, show_default=True, type=int,
               help="Minimum password length baked into the generated script")
 @click.option("--max-length", default=64, show_default=True, type=int,
@@ -804,6 +840,8 @@ def analyze(
     no_llm: bool,
     no_cache: bool,
     api_key: str | None,
+    input_type: str | None,
+    skip_review: bool,
     min_length: int,
     max_length: int,
     require_upper: bool,
@@ -846,7 +884,15 @@ def analyze(
     # Resolve LLM provider
     decoded_for_llm: list[dict] = []
     provider, llm_model = _resolve_llm(llm, api_key, no_llm)
-    pw_only = is_password_file(raw_text)
+
+    if input_type == "passwords":
+        pw_only = True
+        console.print("[dim]--passwords flag: treating input as password list.[/dim]")
+    elif input_type == "profile":
+        pw_only = False
+        console.print("[dim]--profile-file flag: treating input as OSINT profile.[/dim]")
+    else:
+        pw_only = is_password_file(raw_text)
 
     # --- Cache check: skip LLM analysis steps if profile is unchanged ---
     use_cache = False
@@ -1102,45 +1148,76 @@ def analyze(
 
         console.print(f"  Final base words: [green]{len(profile.all_base_words())}[/green]")
 
-    # --- LLM-driven code generation (always runs, even with cache) ---
-    custom_code: str | None = None
+    # --- Save analysis files (no codegen yet) ---
+    cached_steps = ["parse", "categorize", "semantics", "curate"]
+    if not pw_only:
+        cached_steps[3:3] = ["inference", "correlations"]
+    tiers = _classify_words_into_tiers(profile, analysis)
+    write_analysis_files(
+        target_dir, profile, analysis,
+        target_name=name, llm_model=llm_model, raw_text=raw_text,
+        cached_steps=cached_steps,
+    )
+
+    # --- Interactive review ---
+    review = run_review_session(
+        profile, analysis, tiers, target_dir,
+        min_length=min_length, max_length=max_length,
+        require_upper=require_upper, require_lower=require_lower,
+        require_digit=require_digit, require_special=require_special,
+        specials=specials, provider=provider,
+    ) if not skip_review else {
+        "min_length": min_length, "max_length": max_length,
+        "require_upper": require_upper, "require_lower": require_lower,
+        "require_digit": require_digit, "require_special": require_special,
+        "specials": specials, "leet_override": None,
+    }
+
+    min_length = review["min_length"]
+    max_length = review["max_length"]
+    require_upper = review["require_upper"]
+    require_lower = review["require_lower"]
+    require_digit = review["require_digit"]
+    require_special = review["require_special"]
+    specials = review["specials"]
+    leet_override = review.get("leet_override")
+    leet_exhaustive = review.get("leet_exhaustive", False)
+
+    # --- LLM-driven targeted candidate generation ---
+    llm_candidates: list[str] | None = None
 
     if provider:
         intel = build_intelligence_summary(profile, analysis)
         intel["decoded_passwords"] = decoded_for_llm
         intel["profile_data"] = profile.to_dict()
         intel["correlation_insights"] = analysis.correlation_data or []
+        intel["derivation_chains"] = [c.to_dict() for c in analysis.derivation_chains]
 
-        console.print("[dim]LLM: Writing custom generation code...[/dim]")
+        console.print("[dim]LLM: Generating targeted password candidates...[/dim]")
         try:
-            custom_code = provider.generate_custom_code(intel)
-            if custom_code:
+            llm_candidates = provider.generate_targeted_candidates(intel)
+            if llm_candidates:
                 console.print(
-                    f"  [green]LLM wrote custom generate_all() "
-                    f"({len(custom_code.splitlines())} lines).[/green]"
+                    f"  [green]LLM contributed {len(llm_candidates)} targeted candidates.[/green]"
                 )
             else:
-                console.print("  [yellow]LLM code generation returned empty — using fallback.[/yellow]")
-                custom_code = None
+                console.print("  [yellow]LLM returned no candidates — engine will use word pool only.[/yellow]")
         except Exception as exc:
-            console.print(f"  [yellow]LLM code generation failed:[/] {exc}")
-            custom_code = None
+            console.print(f"  [yellow]LLM candidate generation failed:[/] {exc}")
     else:
         console.print(
-            "[yellow]No LLM available — using fallback generator. "
+            "[yellow]No LLM available — using combinatorial engine only. "
             "For better results, rerun with: --llm ollama[/yellow]"
         )
 
-    cached_steps = ["parse", "categorize", "semantics", "curate", "custom_code"]
-    if not pw_only:
-        cached_steps[3:3] = ["inference", "correlations"]
+    cached_steps.append("targeted_candidates")
     write_target_folder(
         target_dir,
         profile,
         analysis,
         target_name=name,
         llm_model=llm_model,
-        custom_code=custom_code,
+        llm_candidates=llm_candidates,
         raw_text=raw_text,
         min_length=min_length,
         max_length=max_length,
@@ -1150,6 +1227,8 @@ def analyze(
         require_special=require_special,
         custom_specials=specials,
         cached_steps=cached_steps,
+        leet_override=leet_override,
+        leet_exhaustive=leet_exhaustive,
     )
 
     console.print(f"\n[bold green]Re-analysis complete.[/bold green] Script regenerated at:")

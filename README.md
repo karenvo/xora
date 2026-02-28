@@ -50,9 +50,46 @@ python3 john-xora/generate_passwords.py --format hydra --username john@corp.com
 | `xora list` | List all targets in the current directory |
 | `xora delete -n <name>` | Delete a target and all artifacts |
 
+## Interactive Review
+
+After analysis completes, xora displays its findings and opens a review session before generating the password script. This lets you inspect the word pool, tweak leet behaviour, and set password policy based on what was actually found.
+
+```
+  Analysis Summary
+  ┌─────────────────────────────────────────────┐
+  │ Passwords: 23   Base words: 41   Numbers: 6 │
+  └─────────────────────────────────────────────┘
+
+  Word Pool        Tier      Words
+  critical         Motley, Crue, ACDC, Ozzy, ...
+  high             Guitar, Rock, Moon, Jungle, ...
+
+  Incremental Password Chains Detected
+    acdc123 → acdc1234 → acdc12345
+
+  Leet Speak Usage  75%  ████████████████
+
+  Review and refine before generating? [Y/n]:
+```
+
+During the session you can:
+
+- **Add or remove words** from the pool inline (e.g. `+metallica -admin`)
+- **Open the word pool in `$EDITOR`** for bulk edits
+- **Request category suggestions** — xora asks the LLM for more words matching the detected themes
+- **Set leet behaviour** — use historical rate, force on/off, set a custom percentage, or choose exhaustive mode (generates every substitution combination — requires a password policy)
+- **Set password policy** — length range, required character classes, allowed specials
+
+Skip the review entirely with `--yes` / `-y`:
+
+```bash
+xora analyze -n john --yes
+xora add -n john -f profile.txt --yes
+```
+
 ## LLM Enhancement (Optional)
 
-Use a local or cloud LLM to enhance profile parsing and generate creative password hypotheses.
+Use a local or cloud LLM to deepen profile analysis and seed the generator with psychologically-targeted guesses.
 
 ```bash
 # Local Ollama (auto-detected if running)
@@ -73,11 +110,43 @@ If `--llm` is not specified, xora auto-detects the best available provider:
 2. Anthropic Claude (if `XORA_API_KEY` or `ANTHROPIC_API_KEY` is set)
 3. Rule-based fallback (no LLM)
 
-The LLM is only used at build time. The generated script is pure Python with no LLM dependency.
+### What the LLM does
 
-### Password-Only Input
+The LLM is used at analysis time only. The generated script is pure Python with zero LLM dependency.
 
-When the input file contains only passwords (no profile fields), xora automatically skips inference and semantic decomposition — these steps require personal context to be meaningful. Categorization and pattern analysis still run.
+When an LLM is available, it performs these tasks:
+
+| Step | What the LLM does |
+|---|---|
+| Profile parsing | Extracts structured data (name, birthdate, interests, etc.) from free text |
+| Password categorisation | Labels passwords by theme (music, family, dates, tech, …) |
+| Semantic decomposition | Identifies the psychological meaning behind each password structure |
+| Inference | Derives additional password-relevant facts from the profile context |
+| Correlations | Cross-references passwords against profile fields to find anchors |
+| Word curation | Selects the most password-relevant words from the full profile |
+| **Targeted candidates** | **Generates 100–200 specific password guesses based on the target's psychology** |
+
+The final step — targeted candidates — is the key one. The LLM returns a **JSON list of password strings** (e.g. `["MotleyCrue1983!", "m0tl3y_cr3w!"]`), not Python code. These are injected into `LLM_CANDIDATES` in the generated script and rise to the top of the ranked output because xora's engine seeds them first.
+
+xora's own combinatorial engine (leet expansion, case variants, separator combos, derivation chain predictions) handles all generation logic — no LLM-written code is ever executed. This keeps the generated script reliable regardless of which model was used.
+
+### Input Type Flags
+
+By default, xora auto-detects whether the input is a password list or a profile. You can override this explicitly:
+
+```bash
+# Input is a plain list of passwords — skips profile parsing, inference, and semantics
+xora add -n target -f passwords.txt --passwords
+
+# Input is a profile/OSINT file — forces full profile parsing even if it looks like passwords
+xora add -n target -f profile.txt --profile-file
+
+# Same flags work on analyze
+xora analyze -n target --passwords
+xora analyze -n target --profile-file
+```
+
+When the input is a password list (auto-detected or via `--passwords`), xora skips inference and semantic decomposition — those steps require personal context to be meaningful. Categorization and pattern analysis still run.
 
 ## Password Policy
 
