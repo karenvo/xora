@@ -91,8 +91,10 @@ During the session you can:
 - **Set password policy** — length range, required character classes, allowed specials
 - **Preview and select candidate seeds before generation**:
   - xora shows a ranked preview of likely base candidates (lower-case concept forms), grouped by confidence
+  - includes derivation-chain predictions and chain-derived word anchors in the preview/tier pool
   - You can keep all (`a`) or select a subset (`top5`, `1 3 8`, `1-10`)
   - Selected seeds are then expanded with the configured case/leet/separator/policy logic
+  - applies to both local and non-local LLM providers
 
 Skip the review entirely with `--yes` / `-y`:
 

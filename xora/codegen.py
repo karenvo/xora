@@ -807,6 +807,25 @@ def _classify_words_into_tiers(
             if sw and " " not in sw:
                 _add(sw, high)
 
+    # Derivation chains: promote chain members and next_likely predictions into
+    # the word pool so they appear in preview/tier output and generation input.
+    # We split on non-letters to capture reusable lexical anchors.
+    chain_split = re.compile(r"[A-Za-z]{3,}")
+    for chain in getattr(analysis, "derivation_chains", []):
+        if isinstance(chain, dict):
+            members = chain.get("members", []) or []
+            next_likely = chain.get("next_likely", []) or []
+        else:
+            members = getattr(chain, "members", []) or []
+            next_likely = getattr(chain, "next_likely", []) or []
+
+        for pw in members:
+            for tok in chain_split.findall(str(pw)):
+                _add(tok, high)
+        for pw in next_likely:
+            for tok in chain_split.findall(str(pw)):
+                _add(tok, critical)
+
     interest_set = {w.lower() for w in (profile.interests + profile.companies)}
     all_base = profile.all_base_words()
     for word in all_base:

@@ -526,7 +526,11 @@ def _base_combos(
 
     # Derivation chain predictions (highest confidence)
     for chain in getattr(analysis, "derivation_chains", []):
-        for pw in chain.get("next_likely", []):
+        if isinstance(chain, dict):
+            next_likely = chain.get("next_likely", [])
+        else:
+            next_likely = getattr(chain, "next_likely", []) or []
+        for pw in next_likely:
             _add(0.97, pw, "derivation prediction")
 
     # LLM-suggested specific passwords

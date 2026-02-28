@@ -184,6 +184,18 @@ def _maybe_review_code(raw_code: str, provider, console) -> str:
         return ""
 
 
+def _skip_preview_for_provider(provider, skip_review: bool) -> bool:
+    """Decide whether preview selection should be skipped.
+
+    Rules:
+      - Always skip if --yes/skip_review is set.
+      - Otherwise run preview selection for all providers (local + non-local).
+    """
+    if skip_review:
+        return True
+    return False
+
+
 def _target_dir(name: str) -> Path:
     return XORA_DIR / f"{name}-xora"
 
@@ -893,8 +905,14 @@ def add(
         )
 
     # --- Preview & select ---
+    preview_skip = _skip_preview_for_provider(provider, skip_review)
+    if provider and preview_skip and not skip_review:
+        console.print(
+            "[dim]Non-local LLM detected — skipping preview selection and "
+            "using full generation set (legacy behavior).[/dim]"
+        )
     tiers, llm_candidates = run_preview_session(
-        tiers, llm_candidates, analysis, skip=skip_review,
+        tiers, llm_candidates, analysis, skip=preview_skip,
     )
 
     console.print("[dim]Generating target folder...[/dim]")
@@ -1354,8 +1372,14 @@ def analyze(
         )
 
     # --- Preview & select ---
+    preview_skip = _skip_preview_for_provider(provider, skip_review)
+    if provider and preview_skip and not skip_review:
+        console.print(
+            "[dim]Non-local LLM detected — skipping preview selection and "
+            "using full generation set (legacy behavior).[/dim]"
+        )
     tiers, llm_candidates = run_preview_session(
-        tiers, llm_candidates, analysis, skip=skip_review,
+        tiers, llm_candidates, analysis, skip=preview_skip,
     )
 
     cached_steps.append("targeted_candidates")
