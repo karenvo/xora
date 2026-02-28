@@ -257,15 +257,25 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
                 results.add("".join(chars))
             return sorted(results)
         else:
-            # Sampled: apply one site at a time, cap results
-            results = [word]
-            for _pos, orig, primary in sites:
-                new_results = []
-                for current in results[:max_variants]:
-                    new_results.append(current.replace(orig, primary, 1))
-                    new_results.append(current.replace(orig.upper(), primary, 1))
-                results.extend(new_results)
-            return list(set(results))[:max_variants * 3]
+            # Sampled: position-aware substitutions with a strict budget.
+            # This avoids noisy global replace() behavior and keeps variants
+            # closer to observed human substitutions.
+            results = {word}
+            budget = max(3, max_variants * 3)
+            max_sites = min(len(sites), max(1, max_variants))
+            # Prefer earlier sites first (often prefix / root substitutions).
+            sampled_sites = sorted(sites, key=lambda s: s[0])[:max_sites]
+            for pos, _orig, primary in sampled_sites:
+                current_snapshot = list(results)[:max_variants]
+                for current in current_snapshot:
+                    chars = list(current)
+                    if pos >= len(chars):
+                        continue
+                    chars[pos] = primary.upper() if chars[pos].isupper() else primary
+                    results.add("".join(chars))
+                    if len(results) >= budget:
+                        return list(results)[:budget]
+            return list(results)[:budget]
 
 
     def _weighted_seps(seps: list[str], total: int = 6) -> list[str]:
@@ -571,6 +581,8 @@ _SCRIPT_SKELETON = textwrap.dedent('''\
               file=sys.stderr)
 
         scored = generate_all(policy)
+        if args.ranked:
+            scored.sort(key=lambda x: x[0], reverse=True)
 
         print(f"[xora] Candidates generated: {{len(scored):,}}", file=sys.stderr)
 
@@ -610,42 +622,67 @@ _FALLBACK_ENGINE = textwrap.dedent('''\
         nums = number_suffixes()
         pref_seps = PREFERRED_SEPARATORS or ["!", "_", "#"]
         wseps = _weighted_seps(pref_seps, total=6)
-        all_words = _all_words()
         leet_pct = STRENGTH_LEET_PCT
 
         seen: set[str] = set()
         scored: list[tuple[float, str]] = []
+        source_counts: dict[str, int] = {}
 
-        def _add(pw: str) -> None:
+        # Generation budgets by source (quality-first ordering).
+        budgets = {
+            "chain": 400,
+            "known": 120,
+            "llm": 300,
+            "template": 1200,
+            "critical": 3200,
+            "medium": 1000,
+            "low": 400,
+            "combo": 1800,
+            "glue": 1200,
+            "account": 600,
+        }
+
+        def _add(pw: str, source: str = "critical") -> None:
             if pw in seen or " " in pw:
+                return
+            if source in budgets and source_counts.get(source, 0) >= budgets[source]:
                 return
             seen.add(pw)
             if passes_policy(pw, pol):
                 scored.append((score_candidate(pw), pw))
+                source_counts[source] = source_counts.get(source, 0) + 1
 
         # Derivation chain next_likely candidates — highest confidence predictions
         for chain in DERIVATION_CHAINS:
-            for pw in chain.get("next_likely", []):
-                _add(pw)
+            for pw in chain.get("next_likely", [])[:20]:
+                _add(pw, "chain")
                 # Also apply case and leet variants for each chain prediction
-                for v in case_variants(pw):
-                    _add(v)
-                for lv in leet_variants(pw):
-                    _add(lv)
+                for v in case_variants(pw)[:3]:
+                    _add(v, "chain")
+                for lv in leet_variants(pw, max_variants=4)[:6]:
+                    _add(lv, "chain")
+                # Add limited numeric + separator mutations around next_likely.
+                for num in nums[:4]:
+                    _add(f"{pw}{num}", "chain")
+                for sep in pref_seps[:2]:
+                    _add(f"{pw}{sep}", "chain")
+                    for num in nums[:3]:
+                        _add(f"{pw}{sep}{num}", "chain")
 
         # Known passwords as-is
         for pw in KNOWN_PASSWORDS:
-            _add(pw)
+            _add(pw, "known")
 
         # LLM candidates (if any were generated in a previous run)
         for pw in LLM_CANDIDATES:
-            _add(pw)
+            _add(pw, "llm")
 
         # --- Expand each word tier ---
         critical = WORD_TIERS.get("critical", [])
         high = WORD_TIERS.get("high", [])
         medium = WORD_TIERS.get("medium", [])
         low = WORD_TIERS.get("low", [])
+        top_words = (critical + high)[:12]
 
         leet_max = (
             10 if leet_pct >= 0.5 else
@@ -653,87 +690,124 @@ _FALLBACK_ENGINE = textwrap.dedent('''\
             2
         )
 
+        # --- Template-driven pass (higher precision, early) ---
+        def _render_template(template: str, w1: str, w2: str, num: str, sep: str) -> str:
+            words = [w1, w2]
+            idx = 0
+            def repl(m):
+                nonlocal idx
+                tok = m.group(1)
+                if tok.startswith("word"):
+                    base = words[min(idx, len(words) - 1)]
+                    idx += 1
+                    if tok == "word_lower":
+                        return base.lower()
+                    if tok == "word_upper":
+                        return base.upper()
+                    if tok == "word_cap":
+                        return base.capitalize()
+                    return case_variants(base)[0]
+                if tok.startswith("year"):
+                    return num if len(num) == 4 else (num[-2:] if len(num) >= 2 else "24")
+                if tok.startswith("num"):
+                    return num[-2:] if len(num) >= 2 else num
+                if tok == "special":
+                    return sep
+                return ""
+            return re.sub(r"\\{(\\w+)\\}", repl, template)
+
+        if PATTERN_TEMPLATES and top_words:
+            for tmpl in PATTERN_TEMPLATES[:10]:
+                for w1 in top_words[:8]:
+                    for w2 in top_words[:6]:
+                        if w1.lower() == w2.lower():
+                            continue
+                        for num in nums[:8]:
+                            for sep in pref_seps[:2]:
+                                pw = _render_template(tmpl, w1, w2, num, sep)
+                                if pw:
+                                    _add(pw, "template")
+
         # Critical + high words: full expansion
         for word in critical + high:
             for variant in case_variants(word):
-                _add(variant)
+                _add(variant, "critical")
                 for num in nums[:12]:
-                    _add(f"{variant}{num}")
+                    _add(f"{variant}{num}", "critical")
                     for sep in wseps:
-                        _add(f"{variant}{sep}{num}")
+                        _add(f"{variant}{sep}{num}", "critical")
                 for sep in wseps:
-                    _add(f"{variant}{sep}")
+                    _add(f"{variant}{sep}", "critical")
 
             if leet_pct >= 0.1:
                 for leet in leet_variants(word, max_variants=leet_max):
-                    _add(leet)
+                    _add(leet, "critical")
                     for num in nums[:8]:
-                        _add(f"{leet}{num}")
+                        _add(f"{leet}{num}", "critical")
                     for sep in wseps[:3]:
-                        _add(f"{leet}{sep}")
+                        _add(f"{leet}{sep}", "critical")
                         for num in nums[:5]:
-                            _add(f"{leet}{sep}{num}")
+                            _add(f"{leet}{sep}{num}", "critical")
 
         # Medium words: lighter expansion
         for word in medium:
             for variant in case_variants(word):
-                _add(variant)
+                _add(variant, "medium")
                 for num in nums[:6]:
-                    _add(f"{variant}{num}")
+                    _add(f"{variant}{num}", "medium")
                 for sep in pref_seps[:2]:
-                    _add(f"{variant}{sep}")
+                    _add(f"{variant}{sep}", "medium")
 
         # Low words: minimal
         for word in low:
-            _add(word.capitalize())
-            _add(word.lower())
+            _add(word.capitalize(), "low")
+            _add(word.lower(), "low")
             for num in nums[:3]:
-                _add(f"{word.capitalize()}{num}")
+                _add(f"{word.capitalize()}{num}", "low")
 
         # --- Two-word combos (critical + high only) ---
         combo_words = (critical + high)[:15]
         for w1, w2 in itertools.permutations(combo_words[:10], 2):
             for sep in pref_seps[:3]:
                 combo = f"{w1.capitalize()}{sep}{w2.capitalize()}"
-                _add(combo)
+                _add(combo, "combo")
                 for num in nums[:5]:
-                    _add(f"{combo}{num}")
+                    _add(f"{combo}{num}", "combo")
             camel = f"{w1.capitalize()}{w2.capitalize()}"
-            _add(camel)
+            _add(camel, "combo")
             for num in nums[:3]:
-                _add(f"{camel}{num}")
+                _add(f"{camel}{num}", "combo")
             if leet_pct >= 0.2:
                 for lv in leet_variants(camel, max_variants=3):
-                    _add(lv)
+                    _add(lv, "combo")
 
         # --- Glue word combos ---
         if GLUE_WORDS:
             for word in combo_words[:10]:
                 for glue in GLUE_WORDS[:6]:
                     base = f"{word.capitalize()}{glue.capitalize()}"
-                    _add(base)
+                    _add(base, "glue")
                     for num in nums[:4]:
-                        _add(f"{base}{num}")
+                        _add(f"{base}{num}", "glue")
                     for sep in pref_seps[:2]:
                         sg = f"{word.capitalize()}{sep}{glue.capitalize()}"
-                        _add(sg)
+                        _add(sg, "glue")
                         for num in nums[:3]:
-                            _add(f"{sg}{num}")
+                            _add(f"{sg}{num}", "glue")
 
         # --- Email/username based ---
         for email in EMAILS:
             user = email.split("@")[0]
-            _add(user)
+            _add(user, "account")
             for num in nums[:5]:
-                _add(f"{user}{num}")
+                _add(f"{user}{num}", "account")
 
         for uname in USERNAMES:
             for variant in case_variants(uname):
-                _add(variant)
+                _add(variant, "account")
                 for num in nums[:5]:
-                    _add(f"{variant}{num}")
+                    _add(f"{variant}{num}", "account")
 
-        scored.sort(key=lambda x: x[0], reverse=True)
         return scored
 ''')
 
