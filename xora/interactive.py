@@ -7,14 +7,17 @@ and decide how generation should behave before the script is written.
 
 from __future__ import annotations
 
+import itertools
 import os
 import subprocess
 import tempfile
 from pathlib import Path
 
+from rich.columns import Columns
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 console = Console()
 
@@ -484,3 +487,254 @@ def run_review_session(
     console.print()
     console.print("[bold green]Review complete.[/bold green] Proceeding to generate...")
     return result
+
+
+# =========================================================================
+# PREVIEW & SELECT SESSION
+# =========================================================================
+
+def _score_word(word: str, tier: str, analysis) -> float:
+    """Return a rough probability score (0–1) for a word."""
+    base = {"critical": 0.92, "high": 0.72, "medium": 0.48, "low": 0.28}.get(tier, 0.3)
+    # Boost if word appears in known passwords
+    kp_lower = [p.lower() for p in getattr(analysis, "known_passwords", [])]
+    hits = sum(1 for p in kp_lower if word.lower() in p)
+    boost = min(hits * 0.04, 0.08)
+    return min(base + boost, 0.99)
+
+
+def _base_combos(
+    tiers: dict[str, list[str]],
+    llm_candidates: list[str],
+    analysis,
+    limit: int = 40,
+) -> list[tuple[float, str, str]]:
+    """Generate representative (score, base_form, source) triples.
+
+    base_form is always lower-case so the user sees the raw concept
+    before case/leet/separator expansion.
+    """
+    seen: set[str] = set()
+    results: list[tuple[float, str, str]] = []
+
+    def _add(score: float, raw: str, source: str) -> None:
+        key = raw.lower()
+        if key in seen or not raw.strip():
+            return
+        seen.add(key)
+        results.append((score, key, source))
+
+    # Derivation chain predictions (highest confidence)
+    for chain in getattr(analysis, "derivation_chains", []):
+        for pw in chain.get("next_likely", []):
+            _add(0.97, pw, "derivation prediction")
+
+    # LLM-suggested specific passwords
+    for pw in (llm_candidates or [])[:30]:
+        _add(0.88, pw, "LLM targeted guess")
+
+    # Known passwords themselves as anchors
+    for pw in getattr(analysis, "known_passwords", [])[:10]:
+        _add(0.85, pw, "known password")
+
+    # Word × number suffix combos (critical tier)
+    for word in tiers.get("critical", [])[:12]:
+        score = _score_word(word, "critical", analysis)
+        _add(score, word, "critical word")
+        for num in ["1", "2", "123", "1234", "2024", "2025"]:
+            _add(score - 0.05, f"{word}{num}", "word+number")
+
+    # Two-word combos (critical × high)
+    crit = tiers.get("critical", [])[:6]
+    high = tiers.get("high", [])[:6]
+    for w1, w2 in itertools.permutations(crit + high, 2):
+        score = _score_word(w1, "critical", analysis) * 0.85
+        _add(score, f"{w1}{w2}", "two-word combo")
+        if len(results) >= limit * 2:
+            break
+
+    # High tier single words
+    for word in high:
+        score = _score_word(word, "high", analysis)
+        _add(score, word, "high word")
+
+    results.sort(key=lambda x: x[0], reverse=True)
+    return results[:limit]
+
+
+def _display_preview(
+    combos: list[tuple[float, str, str]],
+    tiers: dict[str, list[str]],
+    analysis,
+) -> None:
+    """Render the ranked preview table."""
+    console.print()
+    console.print(Panel.fit(
+        "[bold cyan]Password Preview[/bold cyan]\n"
+        "[dim]Ranked candidates shown in base form (lower-case).\n"
+        "Generation will expand each with case variants, leet, separators, and numbers.[/dim]",
+        border_style="cyan",
+    ))
+    console.print()
+
+    # --- Word tiers summary ---
+    tier_table = Table(title="Word Pool", show_header=True, header_style="bold", box=None)
+    tier_table.add_column("Tier", style="bold", width=10)
+    tier_table.add_column("Words", style="cyan")
+    tier_table.add_column("Count", justify="right", style="dim")
+    for tier, color in [("critical", "green"), ("high", "yellow"), ("medium", "white"), ("low", "dim")]:
+        words = tiers.get(tier, [])
+        if words:
+            tier_table.add_row(
+                f"[{color}]{tier}[/{color}]",
+                ", ".join(words[:12]) + (" …" if len(words) > 12 else ""),
+                str(len(words)),
+            )
+    console.print(tier_table)
+    console.print()
+
+    # --- Pattern templates ---
+    templates = getattr(analysis, "pattern_templates", [])[:8]
+    if templates:
+        t2 = Table(title="Observed Structural Patterns", show_header=True, header_style="bold", box=None)
+        t2.add_column("#", justify="right", style="dim", width=3)
+        t2.add_column("Template", style="yellow")
+        for i, tmpl in enumerate(templates, 1):
+            t2.add_row(str(i), tmpl)
+        console.print(t2)
+        console.print()
+
+    # --- Ranked candidate preview ---
+    prev_table = Table(
+        title="Top Candidate Bases (all lower-case → will be expanded)",
+        show_header=True,
+        header_style="bold",
+        box=None,
+    )
+    prev_table.add_column("#", justify="right", style="dim", width=3)
+    prev_table.add_column("Base form", style="bold cyan")
+    prev_table.add_column("Source", style="dim")
+    prev_table.add_column("Probability", justify="right")
+
+    bands = [
+        ("Very high", 0.90, "green"),
+        ("High",      0.75, "yellow"),
+        ("Medium",    0.55, "white"),
+        ("Lower",     0.00, "dim"),
+    ]
+    last_band = ""
+    for idx, (score, base, source) in enumerate(combos, 1):
+        band_label, band_color = "", "white"
+        for label, threshold, color in bands:
+            if score >= threshold:
+                band_label, band_color = label, color
+                break
+        if band_label != last_band:
+            prev_table.add_row("", f"[{band_color}]── {band_label} confidence ──[/{band_color}]", "", "")
+            last_band = band_label
+        prev_table.add_row(
+            str(idx),
+            base,
+            source,
+            f"[{band_color}]{score:.0%}[/{band_color}]",
+        )
+
+    console.print(prev_table)
+
+
+def run_preview_session(
+    tiers: dict[str, list[str]],
+    llm_candidates: list[str] | None,
+    analysis,
+    *,
+    skip: bool = False,
+) -> tuple[dict[str, list[str]], list[str]]:
+    """Show a ranked preview of candidates and let the user narrow the selection.
+
+    Returns a (filtered_tiers, filtered_llm_candidates) tuple. If the user
+    accepts all or ``skip`` is True, the originals are returned unchanged.
+    """
+    llm_candidates = llm_candidates or []
+    combos = _base_combos(tiers, llm_candidates, analysis, limit=40)
+
+    if skip:
+        return tiers, llm_candidates
+
+    _display_preview(combos, tiers, analysis)
+
+    console.print(
+        "\n[bold]Select which candidates to include in generation:[/bold]\n"
+        "  [cyan]a[/cyan]       — keep all (full generation run)\n"
+        "  [cyan]1 3 5[/cyan]   — include only those numbered candidates as seeds\n"
+        "  [cyan]1-10[/cyan]    — include a range\n"
+        "  [cyan]top5[/cyan]    — shorthand for the top 5\n"
+    )
+
+    raw = console.input("[bold cyan]> [/bold cyan]").strip().lower()
+
+    if not raw or raw in ("a", "all", ""):
+        console.print("[dim]Keeping full candidate set.[/dim]")
+        return tiers, llm_candidates
+
+    # Parse top-N shorthand
+    import re as _re
+    top_match = _re.fullmatch(r"top(\d+)", raw)
+    if top_match:
+        raw = " ".join(str(i) for i in range(1, int(top_match.group(1)) + 1))
+
+    # Parse individual numbers and ranges
+    selected_indices: set[int] = set()
+    for token in _re.split(r"[\s,]+", raw):
+        range_match = _re.fullmatch(r"(\d+)-(\d+)", token)
+        if range_match:
+            lo, hi = int(range_match.group(1)), int(range_match.group(2))
+            selected_indices.update(range(lo, hi + 1))
+        elif token.isdigit():
+            selected_indices.add(int(token))
+
+    if not selected_indices:
+        console.print("[dim]Could not parse selection — keeping full candidate set.[/dim]")
+        return tiers, llm_candidates
+
+    selected_combos = [
+        combos[i - 1] for i in sorted(selected_indices)
+        if 1 <= i <= len(combos)
+    ]
+    if not selected_combos:
+        console.print("[dim]No valid selections — keeping full candidate set.[/dim]")
+        return tiers, llm_candidates
+
+    selected_bases = {base for _, base, _ in selected_combos}
+    console.print(
+        f"  [green]Selected {len(selected_bases)} base candidates.[/green] "
+        "Generation will expand these with all configured variants."
+    )
+
+    # Filter LLM candidates to only those whose base matches a selection
+    filtered_llm = [
+        pw for pw in llm_candidates
+        if pw.lower() in selected_bases
+        or any(pw.lower().startswith(b) or b in pw.lower() for b in selected_bases)
+    ]
+
+    # Filter word tiers to only words that appear in selections
+    filtered_tiers: dict[str, list[str]] = {}
+    for tier, words in tiers.items():
+        kept = [w for w in words if w.lower() in selected_bases]
+        # Always keep at least the first critical word so generation is never empty
+        if not kept and tier == "critical" and tiers.get("critical"):
+            kept = tiers["critical"][:3]
+        filtered_tiers[tier] = kept
+
+    # Inject any selected bases that aren't in the tiers as extra critical words
+    all_tier_words_lower = {
+        w.lower() for ws in filtered_tiers.values() for w in ws
+    }
+    extras = [
+        base.capitalize() for _, base, _ in selected_combos
+        if base not in all_tier_words_lower and " " not in base
+    ]
+    if extras:
+        filtered_tiers.setdefault("critical", []).extend(extras)
+
+    return filtered_tiers, filtered_llm

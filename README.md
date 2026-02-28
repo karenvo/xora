@@ -2,6 +2,16 @@
 
 Targeted password wordlist generator for red team engagements using AI.
 
+```text
+  ░▒▓█▓▒░░▒▓█▓▒░ ░▒▓██████▓▒░ ░▒▓███████▓▒░  ░▒▓██████▓▒░
+  ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░
+   ░▒▓█▓▒▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░
+    ░▒▓█▓▓█▓▒░ ░▒▓█▓▒░░▒▓█▓▒░▒▓███████▓▒░ ░▒▓████████▓▒░
+   ░▒▓█▓▒▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░
+  ░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░
+  ░▒▓█▓▒░░▒▓█▓▒░ ░▒▓██████▓▒░ ░▒▓█▓▒░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░
+```
+
 xora takes a free-text profile describing a target and generates a **standalone Python script** that produces high-probability password candidates. The generated script has zero dependencies, runs anywhere Python 3 exists, and pipes directly into attack tools.
 
 ## Install
@@ -79,6 +89,10 @@ During the session you can:
 - **Request category suggestions** — xora asks the LLM for more words matching the detected themes
 - **Set leet behaviour** — use historical rate, force on/off, set a custom percentage, or choose exhaustive mode (generates every substitution combination — requires a password policy)
 - **Set password policy** — length range, required character classes, allowed specials
+- **Preview and select candidate seeds before generation**:
+  - xora shows a ranked preview of likely base candidates (lower-case concept forms), grouped by confidence
+  - You can keep all (`a`) or select a subset (`top5`, `1 3 8`, `1-10`)
+  - Selected seeds are then expanded with the configured case/leet/separator/policy logic
 
 Skip the review entirely with `--yes` / `-y`:
 
@@ -126,9 +140,29 @@ When an LLM is available, it performs these tasks:
 | Word curation | Selects the most password-relevant words from the full profile |
 | **Targeted candidates** | **Generates 100–200 specific password guesses based on the target's psychology** |
 
-The final step — targeted candidates — is the key one. The LLM returns a **JSON list of password strings** (e.g. `["MotleyCrue1983!", "m0tl3y_cr3w!"]`), not Python code. These are injected into `LLM_CANDIDATES` in the generated script and rise to the top of the ranked output because xora's engine seeds them first.
+The LLM contributes to the generated script in two ways:
 
-xora's own combinatorial engine (leet expansion, case variants, separator combos, derivation chain predictions) handles all generation logic — no LLM-written code is ever executed. This keeps the generated script reliable regardless of which model was used.
+1. **Targeted candidates** — A **JSON list of specific password guesses** (e.g. `["MotleyCrue1983!", "m0tl3y_cr3w!"]`) tailored to this person's psychology. Injected into `LLM_CANDIDATES` and ranked first in output.
+2. **Custom generation engine** — A `generate_all()` Python function written by the LLM that encodes target-specific combinatorial strategies. This replaces xora's built-in fallback engine when the code is valid.
+
+### LLM code safety and fallback behavior
+
+When an LLM writes a custom `generate_all()` engine, xora now applies **two safety gates** before embedding it:
+
+1. **Static validation gate** (deterministic checks in xora)
+2. **Provider self-review gate** (the same provider reviews its own code)
+
+So if you use Ollama, Ollama reviews it; if you use Anthropic, Anthropic reviews it.
+
+Validation/review checks include:
+
+- Correct data structure access (e.g., `LEET_MAP[c][0]` not `LEET_MAP[c]`)
+- `WORD_TIERS` key names (`"critical"/"high"/"medium"/"low"`, not category names)
+- Valid `generate_all(policy=None) -> list[tuple[float, str]]` signature
+- No redefined utility functions, no duplicate keyword arguments, no bare imports
+- No known crash patterns (e.g., invalid `LEET_MAP[word]` usage, recursive self-calls)
+
+If generated code fails validation (either before or after review), xora discards it and uses the built-in fallback generation engine. This ensures the script remains runnable even when model output is bad.
 
 ### Input Type Flags
 

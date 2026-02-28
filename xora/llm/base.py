@@ -507,12 +507,15 @@ Expand the word pool using case_variants(), leet_variants(), number_suffixes(), 
 and PREFERRED_SEPARATORS. Theme-specific strategy:
 {theme_specific_instructions}
 
-IMPORTANT CONSTRAINTS:
-- Output ONLY the Python code — no markdown, no explanation
-- Define `generate_all()` and any helper functions it needs
-- Do NOT redefine globals or utility functions (they're already available)
-- Do NOT use bare import statements — all modules are already imported
-- Use f-strings with double braces {{}} for literal braces
+CRITICAL CONSTRAINTS — THESE WILL CAUSE A RUNTIME CRASH IF VIOLATED:
+- Output ONLY the Python function(s) — no markdown, no explanation, no module-level code
+- Do NOT define any of these — they already exist and work correctly:
+    _all_words(), case_variants(), leet_variants(), number_suffixes()
+    score_candidate(), passes_policy(), _weighted_seps()
+  Redefining them will shadow the correct implementations and cause crashes.
+- Do NOT use bare import statements — itertools, random, re, sys are already imported
+- Use f-strings with double braces {{{{}}}} for literal braces inside f-strings
+- You may define private helper functions (prefix with _target_) if needed
 """
 
 # ============================================================================
@@ -542,10 +545,15 @@ Function contract:
 - Must call score_candidate(pw) — do NOT rewrite scoring logic inline
 - Must use seen: set[str] for deduplication
 
+Redefinition check (most common crash source):
+- The script already defines _all_words(), case_variants(), leet_variants(),
+  number_suffixes(), score_candidate(), passes_policy(), _weighted_seps()
+  If the submitted code redefines ANY of these, DELETE the redefinition entirely.
+  The existing implementations are correct — the submitted ones are broken.
+
 Python rules:
 - No duplicate keyword arguments in any function call
 - No bare import statements (itertools, random, re, sys are already imported)
-- No nested function definitions that shadow global utility functions
 - Valid f-string syntax (double braces {{}} for literal braces inside f-strings)
 - No accessing list values with LEET_MAP.get(c, c) — the fallback must be a string
 

@@ -351,3 +351,94 @@ class OllamaProvider(LLMProvider):
 
         response = self._generate(prompt, temperature=0.4)
         return _parse_candidates_response(response)
+
+    # ------------------------------------------------------------------
+    # Code generation (output will be reviewed by Anthropic if available)
+    # ------------------------------------------------------------------
+
+    def generate_custom_code(self, intelligence: dict) -> str:
+        """Write custom generate_all() Python code tailored to this target."""
+        strength = intelligence.get("strength_tier", "unknown")
+        leet_pct = intelligence.get("leet_usage_pct", 0.0)
+        avg_length = intelligence.get("avg_length", 12)
+        pref_seps = intelligence.get("preferred_separators", [])
+        cap_style = intelligence.get("cap_style", "mixed")
+        cat_weights = intelligence.get("category_weights", {})
+        word_tiers = intelligence.get("word_tiers", {})
+
+        top_cats = sorted(
+            cat_weights.items(), key=lambda x: x[1], reverse=True
+        )[:5] if cat_weights else []
+        top_categories = ", ".join(f"{c[0]} ({c[1]:.0%})" for c in top_cats) or "unknown"
+
+        strength_guidance = {
+            "weak": "generate simple passwords: single words + short numbers",
+            "strong": "generate complex passwords: multi-word compounds, deep leet",
+        }.get(strength, "generate balanced passwords: word + separator + number combos")
+
+        leet_guidance = (
+            "apply aggressive leet to most candidates" if leet_pct >= 0.5 else
+            "apply selective leet to about half the candidates" if leet_pct >= 0.2 else
+            "minimal or no leet — keep most passwords clean"
+        )
+
+        theme_lines = [
+            f"   - {cat.upper()}: combine relevant {cat} words from the word pool"
+            for cat, _ in top_cats
+        ] or ["   - Combine critical and high-tier words with numbers and separators"]
+
+        compact_intel = {
+            "word_tier_samples": {k: v[:8] for k, v in word_tiers.items()},
+            "known_passwords": intelligence.get("known_passwords", [])[:15],
+            "pattern_templates": intelligence.get("pattern_templates", [])[:10],
+            "cap_style": cap_style,
+            "cap_patterns": intelligence.get("cap_patterns", {}),
+            "avg_length": avg_length,
+            "preferred_separators": pref_seps,
+            "rare_separators": intelligence.get("rare_separators", []),
+            "strength_tier": strength,
+            "leet_usage_pct": leet_pct,
+            "leet_map": intelligence.get("leet_map", {}),
+            "glue_words": intelligence.get("glue_words", [])[:10],
+            "semantic_templates": intelligence.get("semantic_templates", [])[:8],
+            "category_weights": cat_weights,
+            "derivation_chains": intelligence.get("derivation_chains", [])[:5],
+        }
+
+        prompt = CODE_GENERATION_PROMPT.format(
+            intelligence_json=json.dumps(compact_intel, indent=2),
+            strength_tier=strength,
+            strength_guidance=strength_guidance,
+            leet_pct=leet_pct,
+            leet_guidance=leet_guidance,
+            preferred_seps=json.dumps(pref_seps),
+            avg_length=avg_length,
+            top_categories=top_categories,
+            cap_style=cap_style,
+            theme_specific_instructions="\n".join(theme_lines),
+        )
+
+        response = self._generate(prompt, temperature=0.3)
+        code = self._extract_code(response)
+
+        if "def generate_all" not in code:
+            log.warning("Ollama code generation did not produce generate_all() — using fallback")
+            return ""
+        return code
+
+    def review_generated_code(
+        self,
+        code: str,
+        globals_schema: dict | None = None,
+    ) -> str:
+        """Ask Ollama to review and fix its own generate_all() code."""
+        from xora.llm.base import CODE_REVIEW_PROMPT
+
+        prompt = CODE_REVIEW_PROMPT.format(code=code)
+        response = self._generate(prompt, temperature=0.1)
+        corrected = self._extract_code(response)
+
+        if "def generate_all" not in corrected:
+            log.warning("Ollama code review returned code without generate_all() — keeping original")
+            return code
+        return corrected

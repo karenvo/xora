@@ -1068,7 +1068,6 @@ def generate_script(
     return _SCRIPT_SKELETON.format(**data)
 
 
-# Keep for backward compatibility — delegates to generate_script
 def generate_script_llm(
     profile: TargetProfile,
     analysis: PatternAnalysis,
@@ -1076,7 +1075,6 @@ def generate_script_llm(
     target_name: str,
     llm_model: str = "none",
     llm_candidates: list[str] | None = None,
-    # custom_code is accepted but ignored — engine is always the template
     custom_code: str | None = None,
     min_length: int = 8,
     max_length: int = 64,
@@ -1088,11 +1086,17 @@ def generate_script_llm(
     leet_override: float | None = None,
     leet_exhaustive: bool = False,
 ) -> str:
-    """Deprecated shim — use generate_script() directly."""
-    return generate_script(
+    """Generate script with LLM-written engine code + targeted candidates.
+
+    When ``custom_code`` is provided (and contains a valid generate_all),
+    it replaces the fallback engine. ``llm_candidates`` are always injected
+    into LLM_CANDIDATES regardless.
+    """
+    data = _build_data_constants(
         profile, analysis,
         target_name=target_name,
         llm_model=llm_model,
+        generation_mode=f"LLM-driven ({llm_model})",
         llm_candidates=llm_candidates,
         min_length=min_length,
         max_length=max_length,
@@ -1104,6 +1108,11 @@ def generate_script_llm(
         leet_override=leet_override,
         leet_exhaustive=leet_exhaustive,
     )
+    if custom_code and "def generate_all" in custom_code:
+        data["generation_engine"] = custom_code
+    else:
+        data["generation_engine"] = _FALLBACK_ENGINE
+    return _SCRIPT_SKELETON.format(**data)
 
 
 def build_intelligence_summary(
@@ -1158,7 +1167,6 @@ def write_target_folder(
     target_name: str,
     llm_model: str = "none",
     llm_candidates: list[str] | None = None,
-    # custom_code kept for backward compatibility — ignored
     custom_code: str | None = None,
     raw_text: str = "",
     min_length: int = 8,
@@ -1217,13 +1225,15 @@ def write_target_folder(
     report_path = target_dir / "analysis.md"
     report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
 
-    # The main artifact: standalone generation script
-    # Always uses xora's template engine; LLM candidates seed LLM_CANDIDATES.
-    script = generate_script(
+    # The main artifact: standalone generation script.
+    # custom_code (reviewed LLM engine) is used when present; otherwise falls
+    # back to xora's own template engine. llm_candidates are always injected.
+    script = generate_script_llm(
         profile, analysis,
         target_name=target_name,
         llm_model=llm_model,
         llm_candidates=llm_candidates,
+        custom_code=custom_code,
         min_length=min_length,
         max_length=max_length,
         require_upper=require_upper,

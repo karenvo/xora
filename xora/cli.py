@@ -24,7 +24,7 @@ from xora.codegen import (
     write_analysis_files,
     write_target_folder,
 )
-from xora.interactive import run_review_session
+from xora.interactive import run_preview_session, run_review_session
 from xora.password_profiler import (
     assess_strength_profile,
     build_password_profile,
@@ -71,6 +71,117 @@ BANNER = r"""[cyan]
 [/cyan]
   [dim]targeted password generation[/dim]  [bold red]v{version}[/bold red]
 """
+
+
+def _validate_generated_code(code: str) -> tuple[bool, str]:
+    """Statically validate LLM-generated generate_all() code.
+
+    Returns (ok, reason). If ok is False the code must NOT be used.
+    """
+    import ast
+    import re as _re
+
+    # 1. Must compile cleanly
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        return False, f"SyntaxError: {exc}"
+
+    # 2. Must contain generate_all
+    if "def generate_all" not in code:
+        return False, "missing generate_all()"
+
+    # 3. Must not redefine utility functions that live in the outer script
+    _FORBIDDEN_REDEFS = [
+        "_all_words", "case_variants", "leet_variants", "number_suffixes",
+        "score_candidate", "passes_policy", "_weighted_seps",
+    ]
+    for fn in _FORBIDDEN_REDEFS:
+        if _re.search(rf"^def {fn}\b", code, _re.MULTILINE):
+            return False, f"redefines {fn}() which already exists in the script"
+
+    # 4. Must not use LEET_MAP with a multi-character key (word-level access)
+    #    Legitimate use: LEET_MAP[c], LEET_MAP[char], LEET_MAP.get(c, ...)
+    #    Bad use: LEET_MAP[word], leet_map[word], LEET_MAP[leet_map[word]-1]
+    bad_leet = _re.findall(
+        r'[Ll][Ee][Ee][Tt]_?[Mm][Aa][Pp]\[([^\]]+)\]', code
+    )
+    for key_expr in bad_leet:
+        key_expr = key_expr.strip()
+        # Allow: single-char variable names (c, k, ch), string literals of 1 char
+        if _re.fullmatch(r"[a-zA-Z_]\w*", key_expr):
+            # variable name — flag if it looks like a word variable
+            if key_expr.lower() in ("word", "w", "pw", "password", "base",
+                                    "leet_map", "leet_word", "name"):
+                return False, (
+                    f"LEET_MAP accessed with word-level key '{key_expr}' — "
+                    "LEET_MAP maps single characters, not words. "
+                    "Use leet_variants(word) instead."
+                )
+        elif not _re.fullmatch(r"'[a-z0-9]'|\"[a-z0-9]\"", key_expr):
+            # Not a single-char string literal — could be an expression like
+            # random.randint(...) or len(...) which is also wrong
+            if any(kw in key_expr for kw in ("randint", "len(", "index", "word", "pw")):
+                return False, (
+                    f"LEET_MAP accessed with expression '{key_expr}' — "
+                    "use leet_variants(word) to leet-encode a whole word."
+                )
+
+    # 5. Must not contain bare import statements
+    if _re.search(r"^\s*import\s+\w", code, _re.MULTILINE):
+        return False, "contains bare import statement (all modules already imported)"
+    if _re.search(r"^\s*from\s+\w+\s+import\b", code, _re.MULTILINE):
+        return False, "contains from-import statement (all modules already imported)"
+
+    # 6. Must not contain infinite/unbounded recursion
+    #    Detect any inner function that calls itself unconditionally at the end
+    inner_fns = _re.findall(r"def (_target_\w+|_gen_\w+|_build_\w+)\(", code)
+    for fn in inner_fns:
+        # If the last call in the function body is to itself with no early return guard,
+        # it's almost certainly an infinite recursion
+        fn_body = _re.search(
+            rf"def {_re.escape(fn)}\(.*?\n((?:[ \t]+.*\n)*)", code
+        )
+        if fn_body:
+            body = fn_body.group(1)
+            if _re.search(rf"\b{_re.escape(fn)}\(", body):
+                return False, (
+                    f"{fn}() calls itself recursively — use a loop instead"
+                )
+
+    return True, "ok"
+
+
+def _maybe_review_code(raw_code: str, provider, console) -> str:
+    """Validate then ask the provider to review its own generated code.
+
+    Always validates first with the static checker. If validation fails,
+    the review pass is skipped and "" is returned so the fallback engine runs.
+    After review, validates again before accepting.
+    """
+    ok, reason = _validate_generated_code(raw_code)
+    if not ok:
+        console.print(
+            f"  [yellow]Generated code failed validation:[/] {reason}\n"
+            "  [dim]Using built-in engine instead.[/dim]"
+        )
+        return ""
+
+    try:
+        console.print("  [dim]Running code review pass...[/dim]")
+        reviewed = provider.review_generated_code(raw_code)
+        ok2, reason2 = _validate_generated_code(reviewed)
+        if not ok2:
+            console.print(
+                f"  [yellow]Reviewed code still invalid:[/] {reason2}\n"
+                "  [dim]Using built-in engine instead.[/dim]"
+            )
+            return ""
+        console.print("  [dim]Code review complete.[/dim]")
+        return reviewed
+    except Exception as exc:
+        console.print(f"  [yellow]Code review failed:[/] {exc} — using built-in engine")
+        return ""
 
 
 def _target_dir(name: str) -> Path:
@@ -740,8 +851,9 @@ def add(
     leet_override = review.get("leet_override")
     leet_exhaustive = review.get("leet_exhaustive", False)
 
-    # --- LLM-driven targeted candidate generation ---
+    # --- LLM-driven targeted candidate generation + code generation ---
     llm_candidates: list[str] | None = None
+    custom_code: str | None = None
 
     if provider:
         intel = build_intelligence_summary(profile, analysis)
@@ -762,11 +874,28 @@ def add(
         except Exception as exc:
             console.print(f"  [yellow]LLM candidate generation failed:[/] {exc}")
             console.print("  [dim]Engine will use word pool only.[/dim]")
+
+        console.print("[dim]LLM: Generating custom generation engine...[/dim]")
+        try:
+            raw_code = provider.generate_custom_code(intel)
+            if raw_code:
+                custom_code = _maybe_review_code(raw_code, provider, console)
+                console.print("  [green]Custom generation engine ready.[/green]")
+            else:
+                console.print("  [yellow]LLM skipped code generation — using built-in engine.[/yellow]")
+        except Exception as exc:
+            console.print(f"  [yellow]LLM code generation failed:[/] {exc}")
+            console.print("  [dim]Using built-in combinatorial engine.[/dim]")
     else:
         console.print(
             "[yellow]No LLM available — using combinatorial engine only. "
             "For better results, rerun with: --llm ollama[/yellow]"
         )
+
+    # --- Preview & select ---
+    tiers, llm_candidates = run_preview_session(
+        tiers, llm_candidates, analysis, skip=skip_review,
+    )
 
     console.print("[dim]Generating target folder...[/dim]")
     result_dir = write_target_folder(
@@ -776,6 +905,7 @@ def add(
         target_name=name,
         llm_model=llm_model,
         llm_candidates=llm_candidates,
+        custom_code=custom_code,
         raw_text=raw_text,
         min_length=min_length,
         max_length=max_length,
@@ -1183,8 +1313,9 @@ def analyze(
     leet_override = review.get("leet_override")
     leet_exhaustive = review.get("leet_exhaustive", False)
 
-    # --- LLM-driven targeted candidate generation ---
+    # --- LLM-driven targeted candidate generation + code generation ---
     llm_candidates: list[str] | None = None
+    custom_code: str | None = None
 
     if provider:
         intel = build_intelligence_summary(profile, analysis)
@@ -1204,11 +1335,28 @@ def analyze(
                 console.print("  [yellow]LLM returned no candidates — engine will use word pool only.[/yellow]")
         except Exception as exc:
             console.print(f"  [yellow]LLM candidate generation failed:[/] {exc}")
+
+        console.print("[dim]LLM: Generating custom generation engine...[/dim]")
+        try:
+            raw_code = provider.generate_custom_code(intel)
+            if raw_code:
+                custom_code = _maybe_review_code(raw_code, provider, console)
+                console.print("  [green]Custom generation engine ready.[/green]")
+            else:
+                console.print("  [yellow]LLM skipped code generation — using built-in engine.[/yellow]")
+        except Exception as exc:
+            console.print(f"  [yellow]LLM code generation failed:[/] {exc}")
+            console.print("  [dim]Using built-in combinatorial engine.[/dim]")
     else:
         console.print(
             "[yellow]No LLM available — using combinatorial engine only. "
             "For better results, rerun with: --llm ollama[/yellow]"
         )
+
+    # --- Preview & select ---
+    tiers, llm_candidates = run_preview_session(
+        tiers, llm_candidates, analysis, skip=skip_review,
+    )
 
     cached_steps.append("targeted_candidates")
     write_target_folder(
@@ -1218,6 +1366,7 @@ def analyze(
         target_name=name,
         llm_model=llm_model,
         llm_candidates=llm_candidates,
+        custom_code=custom_code,
         raw_text=raw_text,
         min_length=min_length,
         max_length=max_length,
