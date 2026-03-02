@@ -9,6 +9,25 @@ from abc import ABC, abstractmethod
 
 log = logging.getLogger(__name__)
 
+# Placeholder substrings the LLM sometimes returns instead of real profile data.
+# Any candidate containing these is filtered out — they are never valid passwords.
+_PLACEHOLDER_SUBSTRINGS = frozenset(
+    x.lower()
+    for x in (
+        "first_name",
+        "last_name",
+        "(interest)",
+        "(profile_word)",
+        "(theme_word)",
+    )
+)
+
+
+def _is_placeholder_candidate(candidate: str) -> bool:
+    """Return True if candidate looks like a placeholder instead of a real password."""
+    lower = candidate.lower()
+    return any(ph in lower for ph in _PLACEHOLDER_SUBSTRINGS)
+
 
 def _parse_candidates_response(text: str) -> list[str]:
     """Parse a JSON array of password strings from LLM output.
@@ -49,6 +68,11 @@ def _parse_candidates_response(text: str) -> list[str]:
         return []
 
     candidates = [str(p).strip() for p in data if p and isinstance(p, str) and " " not in str(p)]
+    before = len(candidates)
+    candidates = [c for c in candidates if not _is_placeholder_candidate(c)]
+    dropped = before - len(candidates)
+    if dropped:
+        log.debug("Filtered %d placeholder candidates from LLM response", dropped)
     log.debug("Parsed %d targeted candidates from LLM response", len(candidates))
     return candidates
 
@@ -444,6 +468,13 @@ IMPORTANT:
 - Each element is a plain password string (may include leet, numbers, specials)
 - Do NOT wrap in a function or any other structure
 - Example output: ["MotleyCrue1983!", "m0tl3ycru3!", "MC_1983", ...]
+
+CRITICAL — NEVER output literal placeholders:
+- Every password MUST be a concrete guess using real words from the profile.
+- Do NOT output placeholder strings like first_name, last_name, (interest),
+  (profile_word), or (theme_word). Substitute these with actual values from
+  word_tier_samples, known_passwords, and the intelligence summary. If you
+  lack data for a slot, skip that candidate or use another concrete word.
 """
 
 # ============================================================================

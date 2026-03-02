@@ -133,6 +133,27 @@ def _validate_generated_code(code: str) -> tuple[bool, str]:
     if _re.search(r"^\s*from\s+\w+\s+import\b", code, _re.MULTILINE):
         return False, "contains from-import statement (all modules already imported)"
 
+    # 5b. Must not treat policy dict as a function/metadata registry.
+    # Policy only contains min/max and require_* booleans.
+    bad_policy_refs = [
+        r'pol\["passes_policy"\]',
+        r'pol\["score_candidate"\]',
+        r'pol\["word_tier_samples"\]',
+        r'pol\["cap_style"\]',
+        r'pol\["leet_map"\]',
+        r'pol\["semantic_templates"\]',
+        r'pol\["preferred_separators"\]',
+        r'pol\["strength_tier"\]',
+        r'pol\["glue_words"\]',
+    ]
+    for pat in bad_policy_refs:
+        if _re.search(pat, code):
+            return False, (
+                "uses policy dict for non-policy keys/functions — "
+                "must use global WORD_TIERS/LEET_MAP/PATTERN_TEMPLATES/"
+                "passes_policy()/score_candidate() instead"
+            )
+
     # 6. Must not contain infinite/unbounded recursion
     #    Detect any inner function that calls itself unconditionally at the end
     inner_fns = _re.findall(r"def (_target_\w+|_gen_\w+|_build_\w+)\(", code)
